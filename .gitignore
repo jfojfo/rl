@@ -1,0 +1,8 @@
+__pycache__
+models
+runs
+data
+*.pth
+.DS_Store
+samples
+.idea
