@@ -53,6 +53,17 @@ def wandb_login():
 
     wandb.login(key=secret_wandb)
 
+def wandb_init(name, cfg):
+    if name is not None:
+        import wandb
+        wandb_login()
+        wandb.init(project=name, sync_tensorboard=True, config=cfg)
+
+def wandb_finish(name):
+    if name is not None:
+        import wandb
+        wandb.finish()
+
 
 if __name__ == '__main__':
     MySummaryWriter(0, 100)

@@ -1,6 +1,8 @@
 import os
 import argparse
 from collections import OrderedDict
+
+import numpy as np
 import torch
 import gymnasium as gym
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -11,30 +13,27 @@ from utils import *
 
 config = {
     'model_dir': 'models',
-    'model': f'actor_only.positive_reward',
+    'model': 'actor_only.norm_reward',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pong-actor-only',
+    # 'wandb': 'actor_only.norm_reward',
     'wandb': None,
     'run_in_notebook': False,
 
-    'n_envs': 2,  # simultaneous processing environments
+    'n_envs': 8,  # simultaneous processing environments
     'seq_len': 1,
     'lr': 1e-4,
     'hidden_dim': 256,  # hidden size, linear units of the output layer
     'batch_size': 64,
     'c_entropy': 0.1,  # entropy coefficient
-    'steps_to_test': 256 * 100,  # steps to test and save
+    'steps_to_test': 256 * 200,  # steps to test and save
     'n_tests': 10,  # run this number of tests
     'max_steps': 2000000,
     'target_reward': 20,
 }
 cfg = Config(**config)
-print(cfg)
-
 writer: MySummaryWriter = None
-
 
 
 class SeqModel(nn.Module):
@@ -66,73 +65,83 @@ class SeqModel(nn.Module):
 
 class RoundBuffer:
     def __init__(self):
-        self.history_state_rounds = []
-        self.history_action_rounds = []
-        self.history_reward_rounds = []
+        self.history_states_roundly = []
+        self.history_actions_roundly = []
+        self.history_rewards_roundly = []
         self.pending_states = []
         self.pending_actions = []
+        self.pending_rewards = []
         self.index = 0
 
-    def append(self, state, action, reward):
+    def append(self, state, action, reward, done):
         self.pending_states.append(state)
         self.pending_actions.append(action)
+        # deal with reward
         if reward != 0:
-            if reward > 0:
-                self.history_state_rounds.append(self.pending_states)
-                self.history_action_rounds.append(self.pending_actions)
-                self.history_reward_rounds.append([reward] * len(self.pending_states))
+            l = len(self.pending_states) - len(self.pending_rewards)
+            assert l > 0
+            self.pending_rewards.extend([reward] * l)
+        if reward != 0:
+            self.history_states_roundly.append(self.pending_states)
+            self.history_actions_roundly.append(self.pending_actions)
+            self.history_rewards_roundly.append(self.pending_rewards)
+            self.clear_pending()
+        if done:
             self.clear_pending()
 
     def clear_pending(self):
         self.pending_states = []
         self.pending_actions = []
+        self.pending_rewards = []
 
     def get_last_n_pending_states(self, n):
         assert n >= 0
         begin = max(0, len(self.pending_states) - n)
         return self.pending_states[begin:]
 
-    def has_data(self, seq_len):
-        return len(self.history_state_rounds) > 0
+    def has_data(self, count):
+        assert count > 0
+        return sum([len(states) for states in self.history_states_roundly]) - self.index >= count
 
     def _pop_head(self):
-        self.history_state_rounds = self.history_state_rounds[1:]
-        self.history_action_rounds = self.history_action_rounds[1:]
-        self.history_reward_rounds = self.history_reward_rounds[1:]
+        self.history_states_roundly = self.history_states_roundly[1:]
+        self.history_actions_roundly = self.history_actions_roundly[1:]
+        self.history_rewards_roundly = self.history_rewards_roundly[1:]
 
     def roll_data(self, seq_len):
-        assert self.has_data(seq_len)
-        assert self.index < len(self.history_state_rounds[0])
+        assert self.has_data(1)
+        assert self.index < len(self.history_states_roundly[0])
 
         end = self.index + 1
         begin = max(0, end - seq_len)
 
-        seq_state = self.history_state_rounds[0][begin:end]
-        seq_action = self.history_action_rounds[0][begin:end]
-        seq_reward = self.history_reward_rounds[0][begin:end]
+        seq_state = self.history_states_roundly[0][begin:end]
+        seq_action = self.history_actions_roundly[0][begin:end]
+        seq_reward = self.history_rewards_roundly[0][begin:end]
         assert len(seq_state) > 0
 
         self.index += 1
-        if self.index >= len(self.history_state_rounds[0]):
+        if self.index >= len(self.history_states_roundly[0]):
             self._pop_head()
             self.index = 0
 
         return seq_state, seq_action, seq_reward
 
 class BatchRoundBuffer:
-    def __init__(self, n, seq_len):
+    def __init__(self, n, batch_size, seq_len):
         assert n > 0
         assert seq_len > 0
+        assert batch_size > 0
+        assert batch_size % n == 0
         self.n = n
+        self.batch_size = batch_size
         self.seq_len = seq_len
         # do not use [RoundBuffer()] * n which will create n same round_buffer
         self.round_buffers = [RoundBuffer() for _ in range(n)]
 
     def add(self, state, action, reward, done):
         for i in range(self.n):
-            self.round_buffers[i].append(state[i], action[i], reward[i])
-            if done[i]:
-                self.round_buffers[i].clear_pending()
+            self.round_buffers[i].append(state[i], action[i], reward[i], done[i])
 
     def peek_state_seq(self, state):
         states = []
@@ -153,30 +162,39 @@ class BatchRoundBuffer:
         return masks
 
     def has_full_batch(self):
-        return sum([rb.has_data(self.seq_len) for rb in self.round_buffers]) == len(self.round_buffers)
+        m = self.batch_size // self.n
+        return sum([rb.has_data(m) for rb in self.round_buffers]) == len(self.round_buffers)
 
     def next_batch_seq(self):
+        m = self.batch_size // self.n
         states = []
         actions = []
-        labels = []
-        for i in range(self.n):
-            state, action, reward = self.round_buffers[i].roll_data(self.seq_len)
-            states.append(state)
-            actions.append(action)
-            labels.append(reward[-1])
+        rewards = []
+        for _ in range(m):
+            for i in range(self.n):
+                state, action, reward = self.round_buffers[i].roll_data(self.seq_len)
+                states.append(state)
+                actions.append(action)
+                rewards.append(reward)
         masks = self._pad_seq(states)
         self._pad_seq(actions)
-        return np.array(states), np.array(actions), np.array(masks), np.array(labels)
+        rewards_norm = self.normalize_rewards(np.array(rewards))
+        return np.array(states), np.array(actions), rewards_norm, np.array(masks)
 
+    def normalize_rewards(self, rewards):
+        std = rewards.std()
+        if np.abs(std) < 1e-8:
+            return np.zeros_like(rewards)
+        return (rewards - rewards.mean()) / std
 
-def optimise(model, optimizer, states, actions, masks, labels):
+def optimise(model, optimizer, states, actions, rewards, masks):
     params_feature = model.get_parameter('feature.linear.weight')
 
     dist = model(states)
     actions = actions.reshape(1, len(actions))
     log_probs = dist.log_prob(actions)
     log_probs = log_probs.reshape(-1, 1)
-    actor_loss = -(log_probs * labels.unsqueeze(-1)).mean()
+    actor_loss = -(log_probs * rewards.unsqueeze(-1)).mean()
     entropy_loss = -dist.entropy().mean()
     loss = actor_loss + cfg.c_entropy * entropy_loss
 
@@ -211,7 +229,7 @@ def optimise(model, optimizer, states, actions, masks, labels):
         'entropy_loss': entropy_loss
     })
 
-def train_():
+def train_(load_from):
     global writer
     writer = MySummaryWriter(0, cfg.steps_to_test, comment=f'.{cfg.model}.{cfg.env_id}')
 
@@ -229,9 +247,22 @@ def train_():
     total_runs_1_env = 0
     steps_1_env = 0
     steps = 0
-    best_reward = None
+    best_reward = -np.Inf
 
-    brb = BatchRoundBuffer(cfg.n_envs, cfg.seq_len)
+    if load_from is not None:
+        checkpoint = torch.load(load_from, map_location=cfg.device)
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        steps = checkpoint['global_steps']
+        best_reward = checkpoint['best_reward']
+        print(f'Model loaded, starting from steps {steps}')
+        print('Previous best reward: %.3f' % best_reward)
+
+    print(cfg)
+    print(model)
+    print(optimizer)
+
+    brb = BatchRoundBuffer(cfg.n_envs, cfg.batch_size, cfg.seq_len)
     state = envs.reset()
     state = grey_crop_resize_batch(state)
 
@@ -257,12 +288,12 @@ def train_():
             steps_1_env = 0
 
         if brb.has_full_batch():
-            states, actions, masks, labels = brb.next_batch_seq()
+            states, actions, rewards, masks = brb.next_batch_seq()
             result = optimise(model, optimizer,
                      torch.FloatTensor(states).to(cfg.device),
                      torch.from_numpy(actions).to(cfg.device),
-                     torch.from_numpy(masks).to(cfg.device),
-                     torch.from_numpy(labels).to(cfg.device))
+                     torch.from_numpy(rewards).to(cfg.device),
+                     torch.from_numpy(masks).to(cfg.device))
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), steps)
             writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), steps)
@@ -275,17 +306,18 @@ def train_():
             print('Step: %d -> Reward: %s' % (steps, test_reward))
             writer.add_scalar('Reward/test_reward', test_reward, steps)
 
-            if best_reward is None or best_reward < test_reward:  # save a checkpoint every time it achieves a better reward
-                if best_reward is not None:
-                    print("Best reward updated: %.3f -> %.3f" % (best_reward, test_reward))
-                    name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, test_reward, steps)
-                    fname = os.path.join(cfg.model_dir, name)
-                    states = {
-                        'state_dict': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                    }
-                    torch.save(states, fname)
+            if best_reward < test_reward:  # save a checkpoint every time it achieves a better reward
+                print("Best reward updated: %.3f -> %.3f" % (best_reward, test_reward))
                 best_reward = test_reward
+                name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, test_reward, steps)
+                fname = os.path.join(cfg.model_dir, name)
+                states = {
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_reward': best_reward,
+                    'global_steps': steps,
+                }
+                torch.save(states, fname)
 
             if test_reward > cfg.target_reward:
                 early_stop = True
@@ -297,7 +329,7 @@ def test_env(env, model):
 
     done = False
     total_reward = 0
-    brb = BatchRoundBuffer(1, cfg.seq_len)
+    brb = BatchRoundBuffer(1, 1, cfg.seq_len)
     while not done:
         seq_state, seq_mask = brb.peek_state_seq(state[None, :])
         seq_state = torch.FloatTensor(seq_state).to(cfg.device)
@@ -313,14 +345,9 @@ def test_env(env, model):
 
 
 def train(load_from=None):
-    if cfg.wandb is not None:
-        import wandb
-        wandb_login()
-        wandb.init(project=cfg.wandb, sync_tensorboard=True, config=cfg)
-    train_()
-    if cfg.wandb is not None:
-        import wandb
-        wandb.finish()
+    wandb_init(cfg.wandb, cfg)
+    train_(load_from)
+    wandb_finish(cfg.wandb)
 
 def eval(load_from=None):
     pass
@@ -333,7 +360,7 @@ if __name__ == "__main__":
     ap.add_argument('--model', type=str, default=None, help='model to load')
     args = ap.parse_args(args=[]) if cfg.run_in_notebook else ap.parse_args()
 
-    os.makedirs(cfg.model_dir, mode=0o644, exist_ok=True)
+    os.makedirs(cfg.model_dir, mode=0o755, exist_ok=True)
     if not args.eval:
         train(args.model)
     else:
