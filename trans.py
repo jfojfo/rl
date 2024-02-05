@@ -26,7 +26,7 @@ config = {
     'lr': 1e-4,
     'hidden_dim': 256,  # hidden size, linear units of the output layer
     'batch_size': 64,
-    'c_entropy': 0.1,  # entropy coefficient
+    'c_entropy': 0.0,  # entropy coefficient
     'steps_to_test': 256 * 200,  # steps to test and save
     'n_tests': 10,  # run this number of tests
     'max_steps': 2000000,
@@ -279,6 +279,7 @@ def train_(load_from):
         brb.add(state, action.cpu().numpy(), reward, done)
         state = next_state
         steps += 1
+        writer.update_global_step(steps)
 
         total_reward_1_env += reward[0]
         steps_1_env += 1
