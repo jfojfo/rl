@@ -1,7 +1,7 @@
 import os
 import argparse
 from collections import OrderedDict
-
+import random
 import numpy as np
 import torch
 import gymnasium as gym
@@ -82,9 +82,11 @@ class RoundBuffer:
             assert l > 0
             self.pending_rewards.extend([reward] * l)
         if reward != 0:
-            self.history_states_roundly.append(self.pending_states)
-            self.history_actions_roundly.append(self.pending_actions)
-            self.history_rewards_roundly.append(self.pending_rewards)
+            indices = list(range(len(self.pending_states)))
+            random.shuffle(indices)
+            self.history_states_roundly.append([self.pending_states[i] for i in indices])
+            self.history_actions_roundly.append([self.pending_actions[i] for i in indices])
+            self.history_rewards_roundly.append([self.pending_rewards[i] for i in indices])
             self.clear_pending()
         if done:
             self.clear_pending()
