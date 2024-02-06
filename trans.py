@@ -25,7 +25,7 @@ config = {
     'seq_len': 1,
     'lr': 1e-4,
     'hidden_dim': 256,  # hidden size, linear units of the output layer
-    'batch_size': 64,
+    'batch_size': 256,
     'c_entropy': 0.0,  # entropy coefficient
     'steps_to_test': 256 * 200,  # steps to test and save
     'n_tests': 10,  # run this number of tests
@@ -55,7 +55,7 @@ class SeqModel(nn.Module):
             nn.Softmax(dim=1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         x = x.squeeze(1)
         feature = self.feature(x)
         probs = self.actor(feature)
@@ -180,14 +180,12 @@ class BatchRoundBuffer:
                 rewards.append(reward)
         masks = self._pad_seq(states)
         self._pad_seq(actions)
-        rewards_norm = self.normalize_rewards(np.array(rewards))
-        return np.array(states), np.array(actions), rewards_norm, np.array(masks)
+        rewards = np.array(rewards)
+        # rewards = self.normalize_rewards(rewards)
+        return np.array(states), np.array(actions), rewards, np.array(masks)
 
     def normalize_rewards(self, rewards):
-        std = rewards.std()
-        if np.abs(std) < 1e-8:
-            return np.zeros_like(rewards)
-        return (rewards - rewards.mean()) / std
+        return (rewards - rewards.mean()) / (rewards.std() + 1e-9)
 
 def optimise(model, optimizer, states, actions, rewards, masks):
     params_feature = model.get_parameter('feature.linear.weight')
@@ -273,6 +271,7 @@ def train_(load_from):
         seq_state = torch.FloatTensor(seq_state).to(cfg.device)
         dist = model(seq_state)
         action = dist.sample().to(cfg.device)
+        # action = torch.argmax(dist.probs, dim=1).to(cfg.device)
         next_state, reward, done, _ = envs.step(action.cpu().numpy())
         next_state = grey_crop_resize_batch(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
@@ -338,6 +337,7 @@ def test_env(env, model):
         seq_state = torch.FloatTensor(seq_state).to(cfg.device)
         dist = model(seq_state)
         action = dist.sample().cpu().numpy()[0]
+        # action = torch.argmax(dist.probs).to(cfg.device)
         next_state, reward, done, _, _ = env.step(action)
         next_state = grey_crop_resize(next_state)
 
