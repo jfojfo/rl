@@ -24,7 +24,7 @@ config = {
     'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 256,  # hidden size, linear units of the output layer
-    'c_entropy': 0.1,  # entropy coefficient
+    'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
 
     'max_epoch': 1000000,
@@ -135,17 +135,43 @@ class BatchEpisodeCollector:
         return results
 
 
+class DataGenerator:
+    def __init__(self, batch_size, data_fn, *data):
+        self.batch_size = batch_size
+        self.data_fn = data_fn
+        self.data = data
+
+    def __len__(self):
+        return len(self.data[0]) if len(self.data) > 0 else 0
+
+    def next_batch(self):
+        for i in range(0, len(self), self.batch_size):
+            yield self.data_fn(*[d[i:i + self.batch_size] for d in self.data])
+
+
+def data_fn(states, actions, rewards):
+    states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
+    actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
+    rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
+    return states, actions, rewards
+
+
 # episodes: [(states, actions, rewards, log_probs, entropies), ...]
-def optimise(model, optimizer, states, actions, rewards):
+def optimise(model, optimizer, data_loader):
     params_feature = model.get_parameter('feature.linear.weight')
 
-    dist = model(states)
-    log_prob = dist.log_prob(actions)
-    entropy = dist.entropy()
+    actor_loss = 0
+    entropy_loss = 0
+    for states, actions, rewards in data_loader.next_batch():
+        dist = model(states)
+        log_prob = dist.log_prob(actions)
+        entropy = dist.entropy()
 
-    # todo mean(sum(episode)) ?
-    actor_loss = -(log_prob * rewards).mean()
-    entropy_loss = -entropy.mean()
+        # todo mean(sum(episode)) ?
+        actor_loss += -(log_prob * rewards).sum()
+        entropy_loss += -entropy.sum()
+    actor_loss /= len(data_loader)
+    entropy_loss /= len(data_loader)
     loss = actor_loss + entropy_loss * cfg.c_entropy
 
     if not writer.check_steps():
@@ -181,7 +207,7 @@ def optimise(model, optimizer, states, actions, rewards):
 
 def train_(load_from):
     global writer
-    writer = MySummaryWriter(0, cfg.epoch_episodes * 100, comment=f'.{cfg.model}.{cfg.env_id}')
+    writer = MySummaryWriter(0, 50, comment=f'.{cfg.model}.{cfg.env_id}')
 
     envs = [lambda: gym.make(cfg.env_id, render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs  # Prepare N actors in N environments
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
@@ -241,10 +267,8 @@ def train_(load_from):
                 rewards.extend(ep_rewards)
             avg_reward /= len(episodes)
 
-            states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
-            actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
-            rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
-            result = optimise(model, optimizer, states, actions, rewards)
+            data_loader = DataGenerator(30000, data_fn, states, actions, rewards)
+            result = optimise(model, optimizer, data_loader)
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
             writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), epoch)
