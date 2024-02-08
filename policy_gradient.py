@@ -23,13 +23,13 @@ config = {
 
     'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
-    'hidden_dim': 256,  # hidden size, linear units of the output layer
+    'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
 
     'max_epoch': 1000000,
-    'epoch_episodes': 16,
-    'epoch_save': 1000,
+    'epoch_episodes': 10,
+    'epoch_save': 500,
     'target_reward': 20,
 }
 cfg = Config(**config)
@@ -40,13 +40,17 @@ class SeqModel(nn.Module):
     def __init__(self, cfg: Config, num_outputs) -> None:
         super().__init__()
         self.cfg = cfg
+        # self.feature = nn.Sequential(OrderedDict([
+        #     ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4)),
+        #     ('act1', nn.ReLU()),
+        #     ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2)),
+        #     ('act2', nn.ReLU()),
+        #     ('flatten', nn.Flatten()),
+        #     ('linear', nn.Linear(in_features=32 * 9 * 9, out_features=cfg.hidden_dim)),
+        # ]))
         self.feature = nn.Sequential(OrderedDict([
-            ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4)),
-            ('act1', nn.ReLU()),
-            ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2)),
-            ('act2', nn.ReLU()),
             ('flatten', nn.Flatten()),
-            ('linear', nn.Linear(in_features=32 * 9 * 9, out_features=cfg.hidden_dim)),
+            ('linear', nn.Linear(in_features=80 * 80, out_features=cfg.hidden_dim)),
         ]))
         self.actor = nn.Sequential(  # The “Actor” updates the policy distribution in the direction suggested by the Critic (such as with policy gradients)
             # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
@@ -104,7 +108,6 @@ class BatchEpisodeCollector:
     def __init__(self, n, batch_size):
         assert n > 0
         assert batch_size > 0
-        assert batch_size % n == 0
         self.n = n
         self.batch_size = batch_size
         # do not use [EpisodeCollector()] * n which will create n same objects
@@ -160,6 +163,8 @@ def discount_rewards(rewards, gamma=1.0):
     discounted_rewards = [0] * len(rewards)
     cum_reward = 0
     for i in reversed(range(len(rewards))):
+        if rewards[i] != 0:
+            cum_reward = 0  # reset the sum, since this was a game boundary (pong specific!)
         cum_reward = rewards[i] + gamma * cum_reward
         discounted_rewards[i] = cum_reward
     return discounted_rewards
@@ -247,16 +252,17 @@ def train_(load_from):
 
     collector = BatchEpisodeCollector(cfg.n_envs, cfg.epoch_episodes)
     state = envs.reset()
-    state = grey_crop_resize_batch(state)
+    state = batch_prepro(state)
+    last_state = state.copy()
 
     while not early_stop and epoch < cfg.max_epoch:
-        dist = model(torch.FloatTensor(state).to(cfg.device))
+        dist = model(torch.FloatTensor(state - last_state).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()
         next_state, reward, done, _ = envs.step(action + 2)
-        next_state = grey_crop_resize_batch(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
+        next_state = batch_prepro(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
-        collector.add(state, action, reward, done)
+        collector.add(state - last_state, action, reward, done)
         state = next_state
 
         if collector.has_full_batch():
@@ -274,7 +280,7 @@ def train_(load_from):
                 cum_reward = ep_reward_sum if cum_reward is None else cum_reward * 0.99 + ep_reward_sum * 0.01
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
-                ep_rewards = discount_rewards(ep_rewards)
+                ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
                 ep_rewards = list(normalize_rewards(np.array(ep_rewards)))
                 states.extend(ep_states)
                 actions.extend(ep_actions)
@@ -290,7 +296,8 @@ def train_(load_from):
             writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
 
             state = envs.reset()
-            state = grey_crop_resize_batch(state)
+            state = batch_prepro(state)
+            last_state = state.copy()
             collector.clear_all()
 
             if epoch % cfg.epoch_save == 0:
