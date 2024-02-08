@@ -27,32 +27,48 @@ config = {
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
 
-    'max_epoch': 1000000,
+    'max_batch_size': 100000,  # mlp 10w, cnn 3w
     'epoch_episodes': 10,
     'epoch_save': 500,
+    'max_epoch': 1000000,
     'target_reward': 20,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
 
 
-class SeqModel(nn.Module):
+class MLPModel(nn.Module):
     def __init__(self, cfg: Config, num_outputs) -> None:
         super().__init__()
         self.cfg = cfg
-        # self.feature = nn.Sequential(OrderedDict([
-        #     ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4)),
-        #     ('act1', nn.ReLU()),
-        #     ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2)),
-        #     ('act2', nn.ReLU()),
-        #     ('flatten', nn.Flatten()),
-        #     ('linear', nn.Linear(in_features=32 * 9 * 9, out_features=cfg.hidden_dim)),
-        # ]))
         self.feature = nn.Sequential(OrderedDict([
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=80 * 80, out_features=cfg.hidden_dim)),
         ]))
-        self.actor = nn.Sequential(  # The “Actor” updates the policy distribution in the direction suggested by the Critic (such as with policy gradients)
+        self.actor = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
+        )
+
+    def forward(self, x: torch.Tensor):
+        feature = self.feature(x)
+        logits = self.actor(feature)
+        dist = Categorical(logits=logits)
+        return dist
+
+
+class CNNModel(nn.Module):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4)),
+            ('act1', nn.ReLU()),
+            ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2)),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=32 * 9 * 9, out_features=cfg.hidden_dim)),
+        ]))
+        self.actor = nn.Sequential(
             # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
             # nn.ReLU(),
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
@@ -105,11 +121,9 @@ class EpisodeCollector:
 
 
 class BatchEpisodeCollector:
-    def __init__(self, n, batch_size):
+    def __init__(self, n):
         assert n > 0
-        assert batch_size > 0
         self.n = n
-        self.batch_size = batch_size
         # do not use [EpisodeCollector()] * n which will create n same objects
         self.episode_collectors = [EpisodeCollector() for _ in range(n)]
 
@@ -118,13 +132,11 @@ class BatchEpisodeCollector:
             extra = [pt[i] for pt in extra_pt_tensor]
             self.episode_collectors[i].add(state[i], action[i], reward[i], done[i], *extra)
 
-    def has_full_batch(self):
-        # m = self.batch_size // self.n
-        # return sum([ec.has_n_episodes(m) for ec in self.episode_collectors]) == len(self.episode_collectors)
-        return sum([ec.episodes_count() for ec in self.episode_collectors]) >= self.batch_size
+    def has_full_batch(self, episodes_count):
+        assert episodes_count > 0
+        return sum([ec.episodes_count() for ec in self.episode_collectors]) >= episodes_count
 
     def roll_batch(self):
-        # m = self.batch_size // self.n
         results = []
         for i in range(self.n):
             # ep_extras: [(pt1,pt2,pt3...), (tt1,tt2,tt3,...), ...]
@@ -232,7 +244,7 @@ def train_(load_from):
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
     num_outputs = 2  #envs.action_space.n
 
-    model = SeqModel(cfg, num_outputs).to(cfg.device)
+    model = MLPModel(cfg, num_outputs).to(cfg.device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)  # implements Adam algorithm
 
     early_stop = False
@@ -250,7 +262,7 @@ def train_(load_from):
     print(model)
     print(optimizer)
 
-    collector = BatchEpisodeCollector(cfg.n_envs, cfg.epoch_episodes)
+    collector = BatchEpisodeCollector(cfg.n_envs)
     state = envs.reset()
     state = batch_prepro(state)
     last_state = state.copy()
@@ -265,7 +277,7 @@ def train_(load_from):
         collector.add(state - last_state, action, reward, done)
         state = next_state
 
-        if collector.has_full_batch():
+        if collector.has_full_batch(cfg.epoch_episodes):
             epoch += 1
             writer.update_global_step(epoch)
             avg_reward = 0
@@ -287,7 +299,7 @@ def train_(load_from):
                 rewards.extend(ep_rewards)
             avg_reward /= len(episodes)
 
-            data_loader = DataGenerator(30000, data_fn, states, actions, rewards)
+            data_loader = DataGenerator(cfg.max_batch_size, data_fn, states, actions, rewards)
             result = optimise(model, optimizer, data_loader)
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
