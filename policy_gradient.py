@@ -93,17 +93,11 @@ class EpisodeCollector:
     def has_n_episodes(self, n):
         return len(self.episodes) >= n
 
+    def episodes_count(self):
+        return len(self.episodes)
 
-def discount_rewards(rewards, gamma=1.0):
-    discounted_rewards = [0] * len(rewards)
-    cum_reward = 0
-    for i in reversed(range(len(rewards))):
-        cum_reward = rewards[i] + gamma * cum_reward
-        discounted_rewards[i] = cum_reward
-    return discounted_rewards
-
-def normalize_rewards(rewards):
-    return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    def clear_episodes(self):
+        self.episodes = []
 
 
 class BatchEpisodeCollector:
@@ -122,17 +116,23 @@ class BatchEpisodeCollector:
             self.episode_collectors[i].add(state[i], action[i], reward[i], done[i], *extra)
 
     def has_full_batch(self):
-        m = self.batch_size // self.n
-        return sum([ec.has_n_episodes(m) for ec in self.episode_collectors]) == len(self.episode_collectors)
+        # m = self.batch_size // self.n
+        # return sum([ec.has_n_episodes(m) for ec in self.episode_collectors]) == len(self.episode_collectors)
+        return sum([ec.episodes_count() for ec in self.episode_collectors]) >= self.batch_size
 
     def roll_batch(self):
-        m = self.batch_size // self.n
+        # m = self.batch_size // self.n
         results = []
-        for _ in range(m):
-            for i in range(self.n):
-                # ep_extras: [(pt1,pt2,pt3...), (tt1,tt2,tt3,...), ...]
+        for i in range(self.n):
+            # ep_extras: [(pt1,pt2,pt3...), (tt1,tt2,tt3,...), ...]
+            while self.episode_collectors[i].episodes_count() > 0:
                 results.append(self.episode_collectors[i].roll())
         return results
+
+    def clear_all(self):
+        for i in range(self.n):
+            self.episode_collectors[i].clear_pending()
+            self.episode_collectors[i].clear_episodes()
 
 
 class DataGenerator:
@@ -154,6 +154,19 @@ def data_fn(states, actions, rewards):
     actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
     rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
     return states, actions, rewards
+
+
+def discount_rewards(rewards, gamma=1.0):
+    discounted_rewards = [0] * len(rewards)
+    cum_reward = 0
+    for i in reversed(range(len(rewards))):
+        cum_reward = rewards[i] + gamma * cum_reward
+        discounted_rewards[i] = cum_reward
+    return discounted_rewards
+
+
+def normalize_rewards(rewards):
+    return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
 
 # episodes: [(states, actions, rewards, log_probs, entropies), ...]
@@ -204,6 +217,7 @@ def optimise(model, optimizer, data_loader):
         'actor_loss': actor_loss,
         'entropy_loss': entropy_loss
     })
+
 
 def train_(load_from):
     global writer
@@ -274,6 +288,10 @@ def train_(load_from):
             writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), epoch)
             writer.add_scalar('Loss/Entropy Loss', result.entropy_loss.item(), epoch)
             writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
+
+            state = envs.reset()
+            state = grey_crop_resize_batch(state)
+            collector.clear_all()
 
             if epoch % cfg.epoch_save == 0:
                 name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, cum_reward, epoch)
