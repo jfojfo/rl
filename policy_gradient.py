@@ -275,6 +275,7 @@ def train_(load_from):
         next_state = batch_prepro(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
         collector.add(state - last_state, action, reward, done)
+        last_state = state
         state = next_state
 
         if collector.has_full_batch(cfg.epoch_episodes):
@@ -328,16 +329,18 @@ def train_(load_from):
 
 def test_env(env, model):
     state, _ = env.reset()
-    state = grey_crop_resize(state)
+    state = prepro(state)
+    last_state = state.copy()
 
     done = False
     total_reward = 0
     while not done:
-        state = torch.FloatTensor(state).unsqueeze(0).to(cfg.device)
-        dist, action, log_prob, entropy = model(state)
+        dist = model(torch.FloatTensor(state - last_state).unsqueeze(0).to(cfg.device))
+        action = dist.sample()
         action = action.cpu().numpy()[0]
         next_state, reward, done, _, _ = env.step(action + 2)
-        next_state = grey_crop_resize(next_state)
+        next_state = prepro(next_state)
+        last_state = state
         state = next_state
         total_reward += reward
     return total_reward
@@ -349,7 +352,20 @@ def train(load_from=None):
     wandb_finish(cfg.wandb)
 
 def eval(load_from=None):
-    pass
+    assert load_from is not None
+
+    env_test = gym.make(cfg.env_id, render_mode='human')
+    # num_outputs = env_test.action_space.n
+    num_outputs = 2
+    model = MLPModel(cfg, num_outputs).to(cfg.device)
+    model.eval()
+
+    checkpoint = torch.load(load_from, map_location=cfg.device)
+    model.load_state_dict(checkpoint['state_dict'])
+
+    while True:
+        reward = test_env(env_test, model)
+        print(f"Reward {reward}")
 
 
 if __name__ == "__main__":
