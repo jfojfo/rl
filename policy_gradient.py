@@ -13,7 +13,7 @@ from utils import *
 
 config = {
     'model_dir': 'models',
-    'model': 'pg.episode.norm_discount_reward',
+    'model': 'pg.episode.norm_discount_reward.div_round_count',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -172,7 +172,8 @@ def data_fn(states, actions, rewards):
 
 
 def discount_rewards(rewards, gamma=1.0):
-    discounted_rewards = [0] * len(rewards)
+    # discounted_rewards = [0] * len(rewards)
+    discounted_rewards = np.zeros_like(rewards)
     cum_reward = 0
     for i in reversed(range(len(rewards))):
         if rewards[i] != 0:
@@ -187,7 +188,7 @@ def normalize_rewards(rewards):
 
 
 # episodes: [(states, actions, rewards, log_probs, entropies), ...]
-def optimise(model, optimizer, data_loader):
+def optimise(model, optimizer, data_loader, batch_round_count):
     params_feature = model.get_parameter('feature.linear.weight')
 
     actor_loss = 0
@@ -197,10 +198,11 @@ def optimise(model, optimizer, data_loader):
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
 
-        # todo mean(sum(episode)) ?
         actor_loss += -(log_prob * rewards).sum()
         entropy_loss += -entropy.sum()
-    actor_loss /= len(data_loader)
+    # actor_loss /= len(data_loader)
+    # mean(sum(each round))
+    actor_loss /= batch_round_count
     entropy_loss /= len(data_loader)
     loss = actor_loss + entropy_loss * cfg.c_entropy
 
@@ -286,6 +288,7 @@ def train_(load_from):
             # [(states, actions, rewards, ...), ...]
             episodes = collector.roll_batch()
             states, actions, rewards = [], [], []
+            batch_round_count = 0
             for i, episode in enumerate(episodes):
                 ep_states, ep_actions, ep_rewards = episode
                 ep_reward_sum, ep_steps = sum(ep_rewards), len(ep_rewards)
@@ -293,15 +296,18 @@ def train_(load_from):
                 cum_reward = ep_reward_sum if cum_reward is None else cum_reward * 0.99 + ep_reward_sum * 0.01
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
+                ep_rewards = np.array(ep_rewards)
+                ep_round_count = (ep_rewards != 0).sum()
                 ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
-                ep_rewards = list(normalize_rewards(np.array(ep_rewards)))
+                ep_rewards = list(normalize_rewards(ep_rewards))
                 states.extend(ep_states)
                 actions.extend(ep_actions)
                 rewards.extend(ep_rewards)
+                batch_round_count += ep_round_count
             avg_reward /= len(episodes)
 
             data_loader = DataGenerator(cfg.max_batch_size, data_fn, states, actions, rewards)
-            result = optimise(model, optimizer, data_loader)
+            result = optimise(model, optimizer, data_loader, batch_round_count)
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
             writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), epoch)
