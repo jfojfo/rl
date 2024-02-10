@@ -321,7 +321,7 @@ def train_(load_from):
 
             if epoch % cfg.epoch_save == 0:
                 name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, cum_reward, epoch)
-                fname = os.path.join(cfg.model_dir, name)
+                fname = os.path.join(cfg.model_dir, cfg.model, name)
                 states = {
                     'state_dict': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -381,7 +381,7 @@ if __name__ == "__main__":
     ap.add_argument('--model', type=str, default=None, help='model to load')
     args = ap.parse_args(args=[]) if cfg.run_in_notebook else ap.parse_args()
 
-    os.makedirs(cfg.model_dir, mode=0o755, exist_ok=True)
+    os.makedirs(os.path.join(cfg.model_dir, cfg.model), mode=0o755, exist_ok=True)
     if not args.eval:
         train(args.model)
     else:
