@@ -32,6 +32,7 @@ config = {
     'epoch_save': 500,
     'max_epoch': 1000000,
     'target_reward': 20,
+    'diff_state': True,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
@@ -61,12 +62,12 @@ class CNNModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.feature = nn.Sequential(OrderedDict([
-            ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4)),
+            ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4, padding=2)),
             ('act1', nn.ReLU()),
-            ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2)),
+            ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2, padding=1)),
             ('act2', nn.ReLU()),
             ('flatten', nn.Flatten()),
-            ('linear', nn.Linear(in_features=32 * 9 * 9, out_features=cfg.hidden_dim)),
+            ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.hidden_dim)),
         ]))
         self.actor = nn.Sequential(
             # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
@@ -75,6 +76,7 @@ class CNNModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
+        x = x.permute(0, 3, 1, 2)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
@@ -238,6 +240,10 @@ def optimise(model, optimizer, data_loader, batch_round_count):
     })
 
 
+def get_state(state, last_state):
+    return state if not cfg.diff_state else (state - last_state)
+
+
 def train_(load_from):
     global writer
     writer = MySummaryWriter(0, 50, comment=f'.{cfg.model}.{cfg.env_id}')
@@ -270,13 +276,13 @@ def train_(load_from):
     last_state = state.copy()
 
     while not early_stop and epoch < cfg.max_epoch:
-        dist = model(torch.FloatTensor(state - last_state).to(cfg.device))
+        dist = model(torch.FloatTensor(get_state(state, last_state)).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()
         next_state, reward, done, _ = envs.step(action + 2)
         next_state = batch_prepro(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
-        collector.add(state - last_state, action, reward, done)
+        collector.add(get_state(state, last_state), action, reward, done)
         last_state = state
         state = next_state
 
@@ -341,7 +347,7 @@ def test_env(env, model):
     done = False
     total_reward = 0
     while not done:
-        dist = model(torch.FloatTensor(state - last_state).unsqueeze(0).to(cfg.device))
+        dist = model(torch.FloatTensor(get_state(state, last_state)).unsqueeze(0).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()[0]
         next_state, reward, done, _, _ = env.step(action + 2)
