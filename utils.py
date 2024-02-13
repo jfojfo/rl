@@ -5,7 +5,17 @@ import numpy as np
 
 
 class Config(SimpleNamespace):
-    pass
+    def __init__(self, **kwargs):
+        super().__init__(**{k: self._convert(v) for k, v in kwargs.items()})
+
+    @staticmethod
+    def _convert(value):
+        if isinstance(value, dict):
+            return Config(**value)
+        elif isinstance(value, list):
+            return [Config._convert(item) for item in value]
+        else:
+            return value
 
 
 def prepro(I):
