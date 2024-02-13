@@ -285,6 +285,10 @@ def train_(load_from):
         collector.add(get_state(state, last_state), action, reward, done)
         last_state = state
         state = next_state
+        # reset last_state to state when done
+        for i, d in enumerate(done):
+            if d:
+                last_state[i] = state[i]
 
         if collector.has_full_batch(cfg.epoch_episodes):
             epoch += 1
