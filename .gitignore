@@ -2,8 +2,9 @@ __pycache__
 models
 runs
 data
+logs
+samples
 *.pth
 .DS_Store
-samples
 .idea
-logs
+.vscode
