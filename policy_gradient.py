@@ -20,6 +20,7 @@ config = {
     # 'wandb': 'actor_only.norm_reward',
     'wandb': None,
     'run_in_notebook': False,
+    'model_net': 'mlp',  # mlp, cnn, cnn3d
 
     'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
@@ -28,6 +29,7 @@ config = {
     'gamma': 0.99,
 
     'max_batch_size': 100000,  # mlp 10w, cnn 3w
+    'seq_len': 11,
     'epoch_episodes': 10,
     'epoch_save': 500,
     'max_epoch': 1000000,
@@ -83,22 +85,50 @@ class CNNModel(nn.Module):
         return dist
 
 
+class CNN3dModel(nn.Module):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', nn.Conv3d(in_channels=1, out_channels=16, kernel_size=(3, 8, 8), stride=(2, 4, 4), padding=(0, 2, 2))),
+            ('act1', nn.ReLU()),
+            ('conv2', nn.Conv3d(in_channels=16, out_channels=32, kernel_size=(3, 4, 4), stride=2, padding=(0, 1, 1))),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=32 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
+        ]))
+        self.actor = nn.Sequential(
+            # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
+            # nn.ReLU(),
+            nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
+        )
+
+    def forward(self, x: torch.Tensor):
+        x = x.permute(0, 3, 1, 2)
+        feature = self.feature(x)
+        logits = self.actor(feature)
+        dist = Categorical(logits=logits)
+        return dist
+
+
 class EpisodeCollector:
     def __init__(self):
         self.episodes = []
         self.states = []
         self.actions = []
         self.rewards = []
+        self.dones = []
         self.extras = []
 
     def add(self, state, action, reward, done, *extra_pt_tensors):
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
+        self.dones.append(done)
         self.extras.append(extra_pt_tensors)
         if done:
             assert len(self.actions) > 0
-            self.episodes.append([self.states, self.actions, self.rewards, *zip(*self.extras)])
+            self.episodes.append([self.states, self.actions, self.rewards, self.dones, *zip(*self.extras)])
             self.clear_pending()
 
     def roll(self):
@@ -106,10 +136,16 @@ class EpisodeCollector:
             return self.episodes.pop(0)
         return None
 
+    def peek(self, seq_len):
+        assert seq_len > 0
+        start = max(0, len(self.actions) - seq_len)
+        return self.states[start:], self.actions[start:], self.rewards[start:], self.dones[start:], *zip(*self.extras[start:])
+
     def clear_pending(self):
         self.states = []
         self.actions = []
         self.rewards = []
+        self.dones = []
         self.extras = []
 
     def has_n_episodes(self, n):
@@ -151,12 +187,23 @@ class BatchEpisodeCollector:
             self.episode_collectors[i].clear_pending()
             self.episode_collectors[i].clear_episodes()
 
+    def peek(self, seq_len):
+        for i in range(self.n):
+            self.episode_collectors[i].peek()
+
 
 class DataGenerator:
-    def __init__(self, batch_size, data_fn, *data):
+    def __init__(self, episodes, batch_size, data_fn):
         self.batch_size = batch_size
         self.data_fn = data_fn
-        self.data = data
+        states, actions, rewards, dones = [], [], [], []
+        for episode in episodes:
+            ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
+            states.extend(ep_states)
+            actions.extend(ep_actions)
+            rewards.extend(ep_rewards)
+            dones.extend(ep_dones)
+        self.data = [states, actions, rewards, dones]
 
     def __len__(self):
         return len(self.data[0]) if len(self.data) > 0 else 0
@@ -166,7 +213,35 @@ class DataGenerator:
             yield self.data_fn(*[d[i:i + self.batch_size] for d in self.data])
 
 
-def data_fn(states, actions, rewards):
+class StateSeqDataGenerator(DataGenerator):
+    def __init__(self, episodes, batch_size, seq_len, data_fn):
+        super().__init__(episodes, batch_size, data_fn)
+        self.seq_len = seq_len
+        new_states = []
+        states = self.data[0]
+        dones = self.data[3]
+        last_done_index = -1
+        for i, done in enumerate(dones):
+            end = i + 1
+            j = end - seq_len
+            start = max(0, j)
+            seq_state = states[start:end]
+            zero_state = seq_state[-1] - seq_state[-1]
+            # mask zeroes
+            if last_done_index >= start:
+                count = last_done_index - start + 1
+                seq_state[:count] = [zero_state] * count
+            if j < 0:
+                seq_state = [zero_state] * (-j) + seq_state
+            # update after mask to prevent mask all
+            if done:
+                last_done_index = i
+            new_states.append(seq_state)
+            assert len(seq_state) == seq_len
+        self.data[0] = new_states
+
+
+def data_fn(states, actions, rewards, *_):
     states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
     actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
     rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
@@ -195,7 +270,7 @@ def optimise(model, optimizer, data_loader, batch_round_count):
 
     actor_loss = 0
     entropy_loss = 0
-    for states, actions, rewards in data_loader.next_batch():
+    for states, actions, rewards, *_ in data_loader.next_batch():
         dist = model(states)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
@@ -244,6 +319,17 @@ def get_state(state, last_state):
     return state if not cfg.diff_state else (state - last_state)
 
 
+def get_model():
+    if cfg.model_net == 'mlp':
+        return MLPModel
+    elif cfg.model_net == 'cnn':
+        return CNNModel
+    elif cfg.model_net == 'cnn3d':
+        return CNN3dModel
+    else:
+        return MLPModel
+
+
 def train_(load_from):
     global writer
     writer = MySummaryWriter(0, 50, comment=f'.{cfg.model}.{cfg.env_id}')
@@ -252,7 +338,7 @@ def train_(load_from):
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
     num_outputs = 2  #envs.action_space.n
 
-    model = MLPModel(cfg, num_outputs).to(cfg.device)
+    model = get_model()(cfg, num_outputs).to(cfg.device)
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)  # implements Adam algorithm
 
     early_stop = False
@@ -297,10 +383,9 @@ def train_(load_from):
 
             # [(states, actions, rewards, ...), ...]
             episodes = collector.roll_batch()
-            states, actions, rewards = [], [], []
             batch_round_count = 0
             for i, episode in enumerate(episodes):
-                ep_states, ep_actions, ep_rewards = episode
+                ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
                 ep_reward_sum, ep_steps = sum(ep_rewards), len(ep_rewards)
                 avg_reward += ep_reward_sum
                 cum_reward = ep_reward_sum if cum_reward is None else cum_reward * 0.99 + ep_reward_sum * 0.01
@@ -310,13 +395,11 @@ def train_(load_from):
                 ep_round_count = (ep_rewards != 0).sum()
                 ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
                 ep_rewards = list(normalize_rewards(ep_rewards))
-                states.extend(ep_states)
-                actions.extend(ep_actions)
-                rewards.extend(ep_rewards)
+                episode[2] = ep_rewards
                 batch_round_count += ep_round_count
             avg_reward /= len(episodes)
 
-            data_loader = DataGenerator(cfg.max_batch_size, data_fn, states, actions, rewards)
+            data_loader = DataGenerator(episodes, cfg.max_batch_size, data_fn) if cfg.model_net != 'cnn3d' else StateSeqDataGenerator(episodes, cfg.max_batch_size, cfg.seq_len, data_fn)
             result = optimise(model, optimizer, data_loader, batch_round_count)
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
@@ -373,7 +456,7 @@ def eval(load_from=None):
     env_test = gym.make(cfg.env_id, render_mode='human')
     # num_outputs = env_test.action_space.n
     num_outputs = 2
-    model = MLPModel(cfg, num_outputs).to(cfg.device)
+    model = get_model()(cfg, num_outputs).to(cfg.device)
     model.eval()
 
     checkpoint = torch.load(load_from, map_location=cfg.device)
@@ -382,6 +465,17 @@ def eval(load_from=None):
     while True:
         reward = test_env(env_test, model)
         print(f"Reward {reward}")
+
+
+def test_state_seq_data_generator():
+    episode = [
+        [i+1 for i in range(10)],
+        [i+1 for i in range(10)],
+        [i+1 for i in range(10)],
+        [False, False, True, False, False, True, False, False, False, True],
+    ]
+    g = StateSeqDataGenerator([episode] * 2, 2, 3, data_fn)
+    assert g.data[0] == [[0, 0, 1], [0, 1, 2], [1, 2, 3], [0, 0, 4], [0, 4, 5], [4, 5, 6], [0, 0, 7], [0, 7, 8], [7, 8, 9], [8, 9, 10], [0, 0, 1], [0, 1, 2], [1, 2, 3], [0, 0, 4], [0, 4, 5], [4, 5, 6], [0, 0, 7], [0, 7, 8], [7, 8, 9], [8, 9, 10]]
 
 
 if __name__ == "__main__":
