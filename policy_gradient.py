@@ -282,16 +282,27 @@ def normalize_rewards(rewards):
 
 
 def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
+    acc_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0
+    optimizer.zero_grad()
     for states, actions, rewards, *_ in data_loader.next_batch():
         dist = model(states)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
 
         actor_loss = -(log_prob * rewards).sum() / batch_round_count
-        entropy_loss = -entropy.mean()
+        entropy_loss = -entropy.sum() / len(data_loader)
+        loss = actor_loss + entropy_loss * cfg.c_entropy
+        loss.backward()
 
-        ret = optimise_(model, optimizer, actor_loss, entropy_loss)
-    return ret
+        acc_loss += loss
+        acc_actor_loss += actor_loss
+        acc_entropy_loss += entropy_loss
+    optimizer.step()
+    return Config(**{
+        'loss': acc_loss,
+        'actor_loss': acc_actor_loss,
+        'entropy_loss': acc_entropy_loss
+    })
 
 
 def optimise(model, optimizer, data_loader, batch_round_count):
