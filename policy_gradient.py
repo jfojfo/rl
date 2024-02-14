@@ -13,16 +13,16 @@ from utils import *
 
 config = {
     'model_dir': 'models',
-    'model': 'pg.episode.norm_discount_reward.div_round_count',
+    'model': 'pg.episode.cnn3d',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     # 'wandb': 'actor_only.norm_reward',
     'wandb': None,
     'run_in_notebook': False,
-    'model_net': 'mlp',  # mlp, cnn, cnn3d
+    'model_net': 'cnn3d',  # mlp, cnn, cnn3d
 
-    'n_envs': 8,  # simultaneous processing environments
+    'n_envs': 2,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_entropy': 0.0,  # entropy coefficient
@@ -31,10 +31,10 @@ config = {
     'max_batch_size': 100000,  # mlp 10w, cnn 3w
     'seq_len': 11,
     'epoch_episodes': 10,
-    'epoch_save': 500,
+    'epoch_save': 1,
     'max_epoch': 1000000,
     'target_reward': 20,
-    'diff_state': True,
+    'diff_state': False,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
@@ -104,7 +104,7 @@ class CNN3dModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 4, 1, 2, 3)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
@@ -187,9 +187,17 @@ class BatchEpisodeCollector:
             self.episode_collectors[i].clear_pending()
             self.episode_collectors[i].clear_episodes()
 
-    def peek(self, seq_len):
+    def peek_batch(self, seq_len, state):
+        new_state = []
         for i in range(self.n):
-            self.episode_collectors[i].peek()
+            seq_state, *_ = self.episode_collectors[i].peek(seq_len)
+            d = seq_len - len(seq_state)
+            if d > 0:
+                seq_state = [state[i] - state[i]] * d + seq_state
+            assert len(seq_state) == seq_len
+            seq_state.append(state[i])
+            new_state.append(seq_state)
+        return np.array(new_state)
 
 
 class DataGenerator:
@@ -315,7 +323,7 @@ def optimise(model, optimizer, data_loader, batch_round_count):
     })
 
 
-def get_state(state, last_state):
+def diff_state(state, last_state):
     return state if not cfg.diff_state else (state - last_state)
 
 
@@ -362,13 +370,16 @@ def train_(load_from):
     last_state = state.copy()
 
     while not early_stop and epoch < cfg.max_epoch:
-        dist = model(torch.FloatTensor(get_state(state, last_state)).to(cfg.device))
+        state_ = diff_state(state, last_state)
+        if cfg.model_net == 'cnn3d':
+            state_ = collector.peek_batch(cfg.seq_len - 1, state_)
+        dist = model(torch.FloatTensor(state_).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()
         next_state, reward, done, _ = envs.step(action + 2)
         next_state = batch_prepro(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
-        collector.add(get_state(state, last_state), action, reward, done)
+        collector.add(diff_state(state, last_state), action, reward, done)
         last_state = state
         state = next_state
         # reset last_state to state when done
@@ -431,17 +442,25 @@ def test_env(env, model):
     state = prepro(state)
     last_state = state.copy()
 
+    collector = BatchEpisodeCollector(1)
     done = False
     total_reward = 0
     while not done:
-        dist = model(torch.FloatTensor(get_state(state, last_state)).unsqueeze(0).to(cfg.device))
+        state_ = diff_state(state, last_state)
+        if cfg.model_net == 'cnn3d':
+            state_ = collector.peek_batch(cfg.seq_len - 1, [state_])
+        dist = model(torch.FloatTensor(state_).to(cfg.device))
+        # dist = model(torch.FloatTensor(diff_state(state, last_state)).unsqueeze(0).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()[0]
         next_state, reward, done, _, _ = env.step(action + 2)
         next_state = prepro(next_state)
+
+        collector.add([diff_state(state, last_state)], [action], [reward], [done])
         last_state = state
         state = next_state
         total_reward += reward
+    collector.clear_all()
     return total_reward
 
 
