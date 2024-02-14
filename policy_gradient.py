@@ -22,16 +22,16 @@ config = {
     'run_in_notebook': False,
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d
 
-    'n_envs': 2,  # simultaneous processing environments
+    'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
 
-    'max_batch_size': 100000,  # mlp 10w, cnn 3w
+    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn 3k
     'seq_len': 11,
     'epoch_episodes': 10,
-    'epoch_save': 1,
+    'epoch_save': 500,
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
@@ -201,9 +201,10 @@ class BatchEpisodeCollector:
 
 
 class DataGenerator:
-    def __init__(self, episodes, batch_size, data_fn):
+    def __init__(self, episodes, batch_size, data_fn, random=False):
         self.batch_size = batch_size
         self.data_fn = data_fn
+        self.random = random
         states, actions, rewards, dones = [], [], [], []
         for episode in episodes:
             ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
@@ -216,7 +217,15 @@ class DataGenerator:
     def __len__(self):
         return len(self.data[0]) if len(self.data) > 0 else 0
 
+    def shuffle(self):
+        indices = list(range(len(self)))
+        random.shuffle(indices)
+        for i, d in enumerate(self.data):
+            self.data[i] = [d[i] for i in indices]
+
     def next_batch(self):
+        if self.random:
+            self.shuffle()
         for i in range(0, len(self), self.batch_size):
             yield self.data_fn(*[d[i:i + self.batch_size] for d in self.data])
 
@@ -272,10 +281,20 @@ def normalize_rewards(rewards):
     return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
 
-# episodes: [(states, actions, rewards, log_probs, entropies), ...]
-def optimise(model, optimizer, data_loader, batch_round_count):
-    params_feature = model.get_parameter('feature.linear.weight')
+def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
+    for states, actions, rewards, *_ in data_loader.next_batch():
+        dist = model(states)
+        log_prob = dist.log_prob(actions)
+        entropy = dist.entropy()
 
+        actor_loss = -(log_prob * rewards).sum() / batch_round_count
+        entropy_loss = -entropy.mean()
+
+        ret = optimise_(model, optimizer, actor_loss, entropy_loss)
+    return ret
+
+
+def optimise(model, optimizer, data_loader, batch_round_count):
     actor_loss = 0
     entropy_loss = 0
     for states, actions, rewards, *_ in data_loader.next_batch():
@@ -289,6 +308,14 @@ def optimise(model, optimizer, data_loader, batch_round_count):
     # mean(sum(each round))
     actor_loss /= batch_round_count
     entropy_loss /= len(data_loader)
+
+    return optimise_(model, optimizer, actor_loss, entropy_loss)
+
+
+def optimise_(model, optimizer, *losses):
+    params_feature = model.get_parameter('feature.linear.weight')
+
+    actor_loss, entropy_loss = losses
     loss = actor_loss + entropy_loss * cfg.c_entropy
 
     if not writer.check_steps():
@@ -411,7 +438,10 @@ def train_(load_from):
             avg_reward /= len(episodes)
 
             data_loader = DataGenerator(episodes, cfg.max_batch_size, data_fn) if cfg.model_net != 'cnn3d' else StateSeqDataGenerator(episodes, cfg.max_batch_size, cfg.seq_len, data_fn)
-            result = optimise(model, optimizer, data_loader, batch_round_count)
+            if cfg.model_net == 'cnn3d':
+                result = optimise_by_minibatch(model, optimizer, data_loader, batch_round_count)
+            else:
+                result = optimise(model, optimizer, data_loader, batch_round_count)
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
             writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), epoch)
