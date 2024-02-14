@@ -13,7 +13,7 @@ from utils import *
 
 config = {
     'model_dir': 'models',
-    'model': 'pg.episode.cnn3d',
+    'model': 'pg.episode.cnn3d.chunk_random_batch',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -29,6 +29,7 @@ config = {
     'gamma': 0.99,
 
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn 3k
+    'chunk_percent': 1/6,
     'seq_len': 11,
     'epoch_episodes': 10,
     'epoch_save': 500,
@@ -200,19 +201,13 @@ class BatchEpisodeCollector:
         return np.array(new_state)
 
 
-class DataGenerator:
-    def __init__(self, episodes, batch_size, data_fn, random=False):
+class BaseGenerator:
+    # (s1, s2, ...), (a1, a2, ...), (r1, r2, ...), ...
+    def __init__(self, batch_size, data_fn, random=False, *data):
         self.batch_size = batch_size
         self.data_fn = data_fn
         self.random = random
-        states, actions, rewards, dones = [], [], [], []
-        for episode in episodes:
-            ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
-            states.extend(ep_states)
-            actions.extend(ep_actions)
-            rewards.extend(ep_rewards)
-            dones.extend(ep_dones)
-        self.data = [states, actions, rewards, dones]
+        self.data = list(data)
 
     def __len__(self):
         return len(self.data[0]) if len(self.data) > 0 else 0
@@ -230,9 +225,22 @@ class DataGenerator:
             yield self.data_fn(*[d[i:i + self.batch_size] for d in self.data])
 
 
-class StateSeqDataGenerator(DataGenerator):
-    def __init__(self, episodes, batch_size, seq_len, data_fn):
-        super().__init__(episodes, batch_size, data_fn)
+class EpDataGenerator(BaseGenerator):
+    def __init__(self, episodes, batch_size, data_fn, random=False):
+        states, actions, rewards, dones = [], [], [], []
+        for episode in episodes:
+            ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
+            states.extend(ep_states)
+            actions.extend(ep_actions)
+            rewards.extend(ep_rewards)
+            dones.extend(ep_dones)
+        data = [states, actions, rewards, dones]
+        super().__init__(batch_size, data_fn, random, *data)
+
+
+class StateSeqEpDataGenerator(EpDataGenerator):
+    def __init__(self, episodes, batch_size, seq_len, data_fn, random=False):
+        super().__init__(episodes, batch_size, data_fn, random)
         self.seq_len = seq_len
         new_states = []
         states = self.data[0]
@@ -433,6 +441,7 @@ def train_(load_from):
             # [(states, actions, rewards, ...), ...]
             episodes = collector.roll_batch()
             batch_round_count = 0
+            total_samples = 0
             for i, episode in enumerate(episodes):
                 ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
                 ep_reward_sum, ep_steps = sum(ep_rewards), len(ep_rewards)
@@ -446,13 +455,23 @@ def train_(load_from):
                 ep_rewards = list(normalize_rewards(ep_rewards))
                 episode[2] = ep_rewards
                 batch_round_count += ep_round_count
+                total_samples += len(ep_rewards)
             avg_reward /= len(episodes)
 
-            data_loader = DataGenerator(episodes, cfg.max_batch_size, data_fn) if cfg.model_net != 'cnn3d' else StateSeqDataGenerator(episodes, cfg.max_batch_size, cfg.seq_len, data_fn)
-            if cfg.model_net == 'cnn3d':
-                result = optimise_by_minibatch(model, optimizer, data_loader, batch_round_count)
+            # optimise every 1/4 samples to accelerate training
+            chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
+            # set random True
+            if cfg.model_net != 'cnn3d':
+                chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=True)
             else:
-                result = optimise(model, optimizer, data_loader, batch_round_count)
+                chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=True)
+            for chunk in chunk_loader.next_batch():
+                # minibatch don't exceeds cfg.max_batch_size
+                minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
+                if cfg.model_net == 'cnn3d':
+                    result = optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
+                else:
+                    result = optimise(model, optimizer, minibatch_loader, batch_round_count)
 
             writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
             writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), epoch)
