@@ -347,7 +347,7 @@ def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
     optimizer.zero_grad()
     for states, actions, rewards, *_ in data_loader.next_batch():
         dist, values = model(states)
-        log_prob = dist.log_prob(actions)
+        log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
         values = values.squeeze(1)
 
@@ -357,7 +357,7 @@ def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
         # cum_values = values * 0.99 + rewards * 0.01
 
         critic_loss = 0.5 * (values - rewards).pow(2).sum() / len(data_loader)
-        actor_loss = -(log_prob * advantages).sum() / batch_round_count
+        actor_loss = -(log_probs * advantages).sum() / batch_round_count
         entropy_loss = -entropy.sum() / len(data_loader)
         loss = actor_loss + critic_loss + entropy_loss * cfg.c_entropy
 
@@ -380,11 +380,11 @@ def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
         acc_entropy_loss += entropy_loss
     optimizer.step()
 
-    critic_loss.loss_name = 'critic'
-    actor_loss.loss_name = 'actor'
-    entropy_loss.loss_name = 'entropy'
-    loss.loss_name = 'total'
-    summary_loss(model, optimizer, critic_loss, actor_loss, entropy_loss, loss)
+    acc_critic_loss.loss_name = 'critic'
+    acc_actor_loss.loss_name = 'actor'
+    acc_entropy_loss.loss_name = 'entropy'
+    acc_loss.loss_name = 'total'
+    summary_loss(model, optimizer, acc_critic_loss, acc_actor_loss, acc_entropy_loss, acc_loss)
 
 
 def summary_grad(model, optimizer, *losses):
