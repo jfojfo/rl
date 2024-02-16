@@ -13,12 +13,13 @@ from utils import *
 
 config = {
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d
-    'model': 'pg.episode.cnn3d',
+    'model': 'pg.episode.ac.cnn3d',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'actor_only.norm_reward',
+    # 'wandb': 'pg.episode.ac.cnn3d',
+    # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
 
@@ -28,11 +29,11 @@ config = {
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
 
-    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn 3k
+    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k
     'chunk_percent': 1,
     'seq_len': 11,
     'epoch_episodes': 10,
-    'epoch_save': 200,
+    'epoch_save': 100,
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
@@ -112,9 +113,10 @@ class CNN3dModel(nn.Module):
             ('linear', nn.Linear(in_features=32 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
         ]))
         self.actor = nn.Sequential(
-            # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
-            # nn.ReLU(),
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=1),
         )
 
     def forward(self, x: torch.Tensor):
@@ -122,7 +124,8 @@ class CNN3dModel(nn.Module):
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
-        return dist
+        value = self.critic(feature)
+        return dist, value
 
 
 class CNN3d2dModel(nn.Module):
@@ -339,83 +342,121 @@ def normalize_rewards(rewards):
 
 
 def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
-    acc_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0
+    first_iter = True
+    acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
     for states, actions, rewards, *_ in data_loader.next_batch():
-        dist = model(states)
+        dist, values = model(states)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
+        values = values.squeeze(1)
 
-        actor_loss = -(log_prob * rewards).sum() / batch_round_count
+        advantages = rewards - values.detach()
+        # do not normalize if random shuffled
+        # advantages = normalize_rewards(advantages)
+        # cum_values = values * 0.99 + rewards * 0.01
+
+        critic_loss = 0.5 * (values - rewards).pow(2).sum() / len(data_loader)
+        actor_loss = -(log_prob * advantages).sum() / batch_round_count
         entropy_loss = -entropy.sum() / len(data_loader)
-        loss = actor_loss + entropy_loss * cfg.c_entropy
+        loss = actor_loss + critic_loss + entropy_loss * cfg.c_entropy
+
+        critic_loss.loss_name = 'critic'
+        actor_loss.loss_name = 'actor'
+        entropy_loss.loss_name = 'entropy'
+        loss.loss_name = 'total'
+
+        # summary in the first iteration and zero_grad after that
+        if first_iter:
+            summary_grad(model, optimizer, critic_loss, actor_loss, entropy_loss, loss)
+            optimizer.zero_grad()
+            first_iter = False
+
         loss.backward()
 
         acc_loss += loss
+        acc_critic_loss += critic_loss
         acc_actor_loss += actor_loss
         acc_entropy_loss += entropy_loss
     optimizer.step()
-    return Config(**{
-        'loss': acc_loss,
-        'actor_loss': acc_actor_loss,
-        'entropy_loss': acc_entropy_loss
-    })
+
+    critic_loss.loss_name = 'critic'
+    actor_loss.loss_name = 'actor'
+    entropy_loss.loss_name = 'entropy'
+    loss.loss_name = 'total'
+    summary_loss(model, optimizer, critic_loss, actor_loss, entropy_loss, loss)
 
 
-def optimise(model, optimizer, data_loader, batch_round_count):
-    actor_loss = 0
-    entropy_loss = 0
-    for states, actions, rewards, *_ in data_loader.next_batch():
-        dist = model(states)
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
-
-        actor_loss += -(log_prob * rewards).sum()
-        entropy_loss += -entropy.sum()
-    # actor_loss /= len(data_loader)
-    # mean(sum(each round))
-    actor_loss /= batch_round_count
-    entropy_loss /= len(data_loader)
-
-    return optimise_(model, optimizer, actor_loss, entropy_loss)
-
-
-def optimise_(model, optimizer, *losses):
-    params_feature = model.get_parameter('feature.linear.weight')
-
-    actor_loss, entropy_loss = losses
-    loss = actor_loss + entropy_loss * cfg.c_entropy
-
+def summary_grad(model, optimizer, *losses):
     if not writer.check_steps():
-        optimizer.zero_grad()  # in PyTorch, we need to set the gradients to zero before starting to do backpropragation because PyTorch accumulates the gradients on subsequent backward passes.
-        loss.backward()  # computes dloss/dx for every parameter x which has requires_grad=True. These are accumulated into x.grad for every parameter x
-        optimizer.step()  # performs the parameters update based on the current gradient and the update rule
-    else:
+        return
+    params_feature = model.get_parameter('feature.linear.weight')
+    for loss in losses:
         optimizer.zero_grad()
-        actor_loss.backward(retain_graph=True)
-        grad_actor = params_feature.grad.mean(), params_feature.grad.std()
+        loss.backward(retain_graph=True)
+        grad_mean = params_feature.grad.mean()
+        writer.add_scalar(f'Grad/{loss.loss_name}', grad_mean.item(), writer.global_step)
 
-        optimizer.zero_grad()
-        (entropy_loss * cfg.c_entropy).backward(retain_graph=True)
-        grad_entropy = params_feature.grad.mean(), params_feature.grad.std()
 
-        optimizer.zero_grad()
-        loss.backward()
-        grad_total = params_feature.grad.mean(), params_feature.grad.std()
-        grad_max = params_feature.grad.abs().max()
+def summary_loss(model, optimizer, *losses):
+    for loss in losses:
+        writer.add_scalar(f'Loss/{loss.loss_name}', loss.item(), writer.global_step)    
 
-        optimizer.step()
 
-        writer.add_scalar('Grad/Actor', grad_actor[0].item(), writer.global_step)
-        writer.add_scalar('Grad/Entropy', grad_entropy[0].item(), writer.global_step)
-        writer.add_scalar('Grad/Total', grad_total[0].item(), writer.global_step)
-        writer.add_scalar('Grad/Max', grad_max.item(), writer.global_step)
+# def optimise(model, optimizer, data_loader, batch_round_count):
+#     actor_loss = 0
+#     entropy_loss = 0
+#     for states, actions, rewards, *_ in data_loader.next_batch():
+#         dist = model(states)
+#         log_prob = dist.log_prob(actions)
+#         entropy = dist.entropy()
 
-    return Config(**{
-        'loss': loss,
-        'actor_loss': actor_loss,
-        'entropy_loss': entropy_loss
-    })
+#         actor_loss += -(log_prob * rewards).sum()
+#         entropy_loss += -entropy.sum()
+#     # actor_loss /= len(data_loader)
+#     # mean(sum(each round))
+#     actor_loss /= batch_round_count
+#     entropy_loss /= len(data_loader)
+
+#     return optimise_(model, optimizer, actor_loss, entropy_loss)
+
+
+# def optimise_(model, optimizer, *losses):
+#     params_feature = model.get_parameter('feature.linear.weight')
+
+#     actor_loss, entropy_loss = losses
+#     loss = actor_loss + entropy_loss * cfg.c_entropy
+
+#     if not writer.check_steps():
+#         optimizer.zero_grad()  # in PyTorch, we need to set the gradients to zero before starting to do backpropragation because PyTorch accumulates the gradients on subsequent backward passes.
+#         loss.backward()  # computes dloss/dx for every parameter x which has requires_grad=True. These are accumulated into x.grad for every parameter x
+#         optimizer.step()  # performs the parameters update based on the current gradient and the update rule
+#     else:
+#         optimizer.zero_grad()
+#         actor_loss.backward(retain_graph=True)
+#         grad_actor = params_feature.grad.mean(), params_feature.grad.std()
+
+#         optimizer.zero_grad()
+#         (entropy_loss * cfg.c_entropy).backward(retain_graph=True)
+#         grad_entropy = params_feature.grad.mean(), params_feature.grad.std()
+
+#         optimizer.zero_grad()
+#         loss.backward()
+#         grad_total = params_feature.grad.mean(), params_feature.grad.std()
+#         grad_max = params_feature.grad.abs().max()
+
+#         optimizer.step()
+
+#         writer.add_scalar('Grad/Actor', grad_actor[0].item(), writer.global_step)
+#         writer.add_scalar('Grad/Entropy', grad_entropy[0].item(), writer.global_step)
+#         writer.add_scalar('Grad/Total', grad_total[0].item(), writer.global_step)
+#         writer.add_scalar('Grad/Max', grad_max.item(), writer.global_step)
+
+#     return Config(**{
+#         'loss': loss,
+#         'actor_loss': actor_loss,
+#         'entropy_loss': entropy_loss
+#     })
 
 
 def diff_state(state, last_state):
@@ -457,7 +498,7 @@ def train_(load_from):
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_batch(cfg.seq_len - 1, state_)
-        dist = model(torch.FloatTensor(state_).to(cfg.device))
+        dist, value = model(torch.FloatTensor(state_).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()
         next_state, reward, done, _ = envs.step(action + 2)
@@ -490,12 +531,13 @@ def train_(load_from):
                 ep_rewards = np.array(ep_rewards)
                 ep_round_count = (ep_rewards != 0).sum()
                 ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
-                ep_rewards = normalize_rewards(ep_rewards)
+                # ep_rewards = normalize_rewards(ep_rewards)
                 ep_rewards = list(ep_rewards)
                 episode[2] = ep_rewards
                 batch_round_count += ep_round_count
                 total_samples += len(ep_rewards)
             avg_reward /= len(episodes)
+            writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
 
             # optimise every 1/4 samples to accelerate training
             chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
@@ -507,15 +549,11 @@ def train_(load_from):
             for chunk in chunk_loader.next_batch():
                 # minibatch don't exceeds cfg.max_batch_size
                 minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
-                if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-                    result = optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
-                else:
-                    result = optimise(model, optimizer, minibatch_loader, batch_round_count)
-
-            writer.add_scalar('Loss/Total Loss', result.loss.item(), epoch)
-            writer.add_scalar('Loss/Actor Loss', result.actor_loss.item(), epoch)
-            writer.add_scalar('Loss/Entropy Loss', result.entropy_loss.item(), epoch)
-            writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
+                optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
+                # if cfg.model_net in ('cnn3d', 'cnn3d2d'):
+                #     optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
+                # else:
+                #     optimise(model, optimizer, minibatch_loader, batch_round_count)
 
             state = envs.reset()
             state = batch_prepro(state)
@@ -549,7 +587,7 @@ def test_env(env, model):
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_batch(cfg.seq_len - 1, [state_])
-        dist = model(torch.FloatTensor(state_).to(cfg.device))
+        dist, value = model(torch.FloatTensor(state_).to(cfg.device))
         # dist = model(torch.FloatTensor(diff_state(state, last_state)).unsqueeze(0).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()[0]
