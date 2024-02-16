@@ -1,7 +1,12 @@
 from types import SimpleNamespace
+import torch
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 import numpy as np
+
+
+normal_repr = torch.Tensor.__repr__
+torch.Tensor.__repr__ = lambda self: f"{self.shape} {normal_repr(self)}"
 
 
 class Config(SimpleNamespace):

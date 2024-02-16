@@ -12,15 +12,15 @@ from torch.distributions import Categorical
 from utils import *
 
 config = {
+    'model_net': 'cnn3d',  # mlp, cnn, cnn3d
+    'model': 'pg.episode.cnn3d',
     'model_dir': 'models',
-    'model': 'pg.episode.cnn3d.chunk_random_batch',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     # 'wandb': 'actor_only.norm_reward',
     'wandb': None,
     'run_in_notebook': False,
-    'model_net': 'cnn3d',  # mlp, cnn, cnn3d
 
     'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
@@ -29,16 +29,29 @@ config = {
     'gamma': 0.99,
 
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn 3k
-    'chunk_percent': 1/6,
+    'chunk_percent': 1,
     'seq_len': 11,
     'epoch_episodes': 10,
-    'epoch_save': 500,
+    'epoch_save': 200,
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
+
+
+def get_model():
+    if cfg.model_net == 'mlp':
+        return MLPModel
+    elif cfg.model_net == 'cnn':
+        return CNNModel
+    elif cfg.model_net == 'cnn3d':
+        return CNN3dModel
+    elif cfg.model_net == 'cnn3d2d':
+        return CNN3d2dModel
+    else:
+        return MLPModel
 
 
 class MLPModel(nn.Module):
@@ -107,6 +120,42 @@ class CNN3dModel(nn.Module):
     def forward(self, x: torch.Tensor):
         x = x.permute(0, 4, 1, 2, 3)
         feature = self.feature(x)
+        logits = self.actor(feature)
+        dist = Categorical(logits=logits)
+        return dist
+
+
+class CNN3d2dModel(nn.Module):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.feature3d = nn.Sequential(OrderedDict([
+            ('conv1', nn.Conv3d(in_channels=1, out_channels=16, kernel_size=(3, 8, 8), stride=(2, 4, 4), padding=(0, 2, 2))),
+            ('act1', nn.ReLU()),
+            ('conv2', nn.Conv3d(in_channels=16, out_channels=32, kernel_size=(3, 4, 4), stride=2, padding=(0, 1, 1))),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=32 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
+        ]))
+        self.feature2d = nn.Sequential(OrderedDict([
+            ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4, padding=2)),
+            ('act1', nn.ReLU()),
+            ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2, padding=1)),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.hidden_dim)),
+        ]))
+        self.actor = nn.Sequential(
+            # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
+            # nn.ReLU(),
+            nn.Linear(in_features=cfg.hidden_dim * 2, out_features=num_outputs),
+        )
+
+    def forward(self, x: torch.Tensor):
+        x = x.permute(0, 4, 1, 2, 3)
+        feature3d = self.feature3d(x)
+        feature2d = self.feature2d(x[:, :, -1, ...])
+        feature = torch.cat([feature3d, feature2d], dim=-1)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
         return dist
@@ -373,17 +422,6 @@ def diff_state(state, last_state):
     return state if not cfg.diff_state else (state - last_state)
 
 
-def get_model():
-    if cfg.model_net == 'mlp':
-        return MLPModel
-    elif cfg.model_net == 'cnn':
-        return CNNModel
-    elif cfg.model_net == 'cnn3d':
-        return CNN3dModel
-    else:
-        return MLPModel
-
-
 def train_(load_from):
     global writer
     writer = MySummaryWriter(0, 50, comment=f'.{cfg.model}.{cfg.env_id}')
@@ -417,7 +455,7 @@ def train_(load_from):
 
     while not early_stop and epoch < cfg.max_epoch:
         state_ = diff_state(state, last_state)
-        if cfg.model_net == 'cnn3d':
+        if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_batch(cfg.seq_len - 1, state_)
         dist = model(torch.FloatTensor(state_).to(cfg.device))
         action = dist.sample()
@@ -452,7 +490,8 @@ def train_(load_from):
                 ep_rewards = np.array(ep_rewards)
                 ep_round_count = (ep_rewards != 0).sum()
                 ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
-                ep_rewards = list(normalize_rewards(ep_rewards))
+                ep_rewards = normalize_rewards(ep_rewards)
+                ep_rewards = list(ep_rewards)
                 episode[2] = ep_rewards
                 batch_round_count += ep_round_count
                 total_samples += len(ep_rewards)
@@ -461,14 +500,14 @@ def train_(load_from):
             # optimise every 1/4 samples to accelerate training
             chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
             # set random True
-            if cfg.model_net != 'cnn3d':
-                chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=True)
-            else:
+            if cfg.model_net in ('cnn3d', 'cnn3d2d'):
                 chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=True)
+            else:
+                chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=True)
             for chunk in chunk_loader.next_batch():
                 # minibatch don't exceeds cfg.max_batch_size
                 minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
-                if cfg.model_net == 'cnn3d':
+                if cfg.model_net in ('cnn3d', 'cnn3d2d'):
                     result = optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
                 else:
                     result = optimise(model, optimizer, minibatch_loader, batch_round_count)
@@ -505,9 +544,10 @@ def test_env(env, model):
     collector = BatchEpisodeCollector(1)
     done = False
     total_reward = 0
+    steps = 0
     while not done:
         state_ = diff_state(state, last_state)
-        if cfg.model_net == 'cnn3d':
+        if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_batch(cfg.seq_len - 1, [state_])
         dist = model(torch.FloatTensor(state_).to(cfg.device))
         # dist = model(torch.FloatTensor(diff_state(state, last_state)).unsqueeze(0).to(cfg.device))
@@ -520,8 +560,9 @@ def test_env(env, model):
         last_state = state
         state = next_state
         total_reward += reward
+        steps += 1
     collector.clear_all()
-    return total_reward
+    return total_reward, steps
 
 
 def train(load_from=None):
@@ -542,8 +583,8 @@ def eval(load_from=None):
     model.load_state_dict(checkpoint['state_dict'])
 
     while True:
-        reward = test_env(env_test, model)
-        print(f"Reward {reward}")
+        reward, steps = test_env(env_test, model)
+        print(f"steps {steps}, reward {reward}")
 
 
 def test_state_seq_data_generator():
