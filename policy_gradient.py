@@ -28,7 +28,7 @@ config = {
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
 
-    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn 3k
+    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k
     'chunk_percent': 1,
     'seq_len': 11,
     'epoch_episodes': 10,
