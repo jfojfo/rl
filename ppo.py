@@ -13,7 +13,7 @@ from utils import *
 
 config = {
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d
-    'model': 'pg.episode.ppo.cnn3d',
+    'model': 'pg.episode.ppo.cnn3d.chunk_1_64',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -32,7 +32,7 @@ config = {
 
     'optimise_times': 10,  # optimise times per epoch
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k
-    'chunk_percent': 1/16,  # split into chunks, do optimise per chunk
+    'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
     'seq_len': 11,
     'epoch_episodes': 10,
     'epoch_save': 20,
@@ -394,6 +394,7 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs):
 
 
 def optimise_by_minibatch(model, optimizer, data_loader):
+    summary = {}
     first_iter = True
     acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
@@ -401,14 +402,9 @@ def optimise_by_minibatch(model, optimizer, data_loader):
         old_log_probes = extra[0]
         critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, rewards, old_log_probes)
 
-        critic_loss.loss_name = 'critic'
-        actor_loss.loss_name = 'actor'
-        entropy_loss.loss_name = 'entropy'
-        loss.loss_name = 'total'
-
         # summary in the first iteration and zero_grad after that
         if first_iter:
-            summary_grad(model, optimizer, critic_loss, actor_loss, entropy_loss, loss)
+            summary_grad(summary, model, optimizer, {'critic': critic_loss, 'actor': actor_loss, 'entropy': entropy_loss, 'total': loss})
             optimizer.zero_grad()
             first_iter = False
 
@@ -420,27 +416,29 @@ def optimise_by_minibatch(model, optimizer, data_loader):
         acc_entropy_loss += entropy_loss
     optimizer.step()
 
-    acc_critic_loss.loss_name = 'critic'
-    acc_actor_loss.loss_name = 'actor'
-    acc_entropy_loss.loss_name = 'entropy'
-    acc_loss.loss_name = 'total'
-    summary_loss(model, optimizer, acc_critic_loss, acc_actor_loss, acc_entropy_loss, acc_loss)
+    summary_loss(summary, model, optimizer, {'critic': acc_critic_loss, 'actor': acc_actor_loss, 'entropy': acc_entropy_loss, 'total': acc_loss})
+    return summary
 
 
-def summary_grad(model, optimizer, *losses):
+def summary_grad(summary, model, optimizer, losses):
     if not writer.check_steps():
         return
     params_feature = model.get_parameter('feature.linear.weight')
-    for loss in losses:
+    for name, loss in losses.items():
         optimizer.zero_grad()
         loss.backward(retain_graph=True)
         grad_mean = params_feature.grad.mean()
-        writer.add_scalar(f'Grad/{loss.loss_name}', grad_mean.item(), writer.global_step)
+        summary[f'Grad/{name}'] = grad_mean.item()
 
 
-def summary_loss(model, optimizer, *losses):
-    for loss in losses:
-        writer.add_scalar(f'Loss/{loss.loss_name}', loss.item(), writer.global_step)    
+def summary_loss(summary, model, optimizer, losses):
+    for name, loss in losses.items():
+        summary[f'Loss/{name}'] = loss.item()
+
+
+def write_summary(summary):
+    for k, v in summary.items():
+        writer.add_scalar(k, v, writer.global_step)
 
 
 # def optimise(model, optimizer, data_loader, batch_round_count):
@@ -588,7 +586,9 @@ def train_(load_from):
                 for chunk in chunk_loader.next_batch():
                     # minibatch don't exceeds cfg.max_batch_size
                     minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
-                    optimise_by_minibatch(model, optimizer, minibatch_loader)
+                    summary = optimise_by_minibatch(model, optimizer, minibatch_loader)
+            # write summary once after optimise_times to prevent duplicate
+            write_summary(summary)
 
             state = envs.reset()
             state = batch_prepro(state)
