@@ -12,13 +12,13 @@ from torch.distributions import Categorical
 from utils import *
 
 config = {
-    'model_net': 'cnn3d',  # mlp, cnn, cnn3d
-    'model': 'pg.episode.ac.cnn3d',
+    'model_net': 'mlp',  # mlp, cnn, cnn3d
+    'model': 'pg.episode.ppo.mlp',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pg.episode.ac.cnn3d',
+    # 'wandb': 'pg.episode.ppo.mlp',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
@@ -28,15 +28,17 @@ config = {
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
+    'surr_clip': 0.2,
 
+    'optimise_times': 10,  # optimise times per epoch
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k
-    'chunk_percent': 1,
+    'chunk_percent': 1/16,  # split into chunks, do optimise per chunk
     'seq_len': 11,
     'epoch_episodes': 10,
-    'epoch_save': 100,
+    'epoch_save': 200,
     'max_epoch': 1000000,
     'target_reward': 20,
-    'diff_state': False,
+    'diff_state': True,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
@@ -66,12 +68,16 @@ class MLPModel(nn.Module):
         self.actor = nn.Sequential(
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
         )
+        self.critic = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=1),
+        )
 
     def forward(self, x: torch.Tensor):
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
-        return dist
+        value = self.critic(feature)
+        return dist, value
 
 
 class CNNModel(nn.Module):
@@ -177,7 +183,7 @@ class EpisodeCollector:
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
-        self.dones.append(done)
+        self.dones.append(bool(done))  # prevent torch.as_tensor throwing warning for np.bool_ array
         self.extras.append(extra_pt_tensors)
         if done:
             assert len(self.actions) > 0
@@ -280,13 +286,21 @@ class BaseGenerator:
 class EpDataGenerator(BaseGenerator):
     def __init__(self, episodes, batch_size, data_fn, random=False):
         states, actions, rewards, dones = [], [], [], []
+        extra = []
+        round_count = 0
         for episode in episodes:
-            ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
+            ep_states, ep_actions, ep_rewards, ep_dones, *ep_extra = episode
+            t = np.array(ep_rewards)
+            round_count += np.sum(t == 1) + np.sum(t == -1)
             states.extend(ep_states)
             actions.extend(ep_actions)
             rewards.extend(ep_rewards)
             dones.extend(ep_dones)
-        data = [states, actions, rewards, dones]
+            if len(extra) == 0:
+                extra = [[]] * len(ep_extra)
+            extra = [extra[i] + list(e) for i, e in enumerate(ep_extra)]
+        self.round_count = round_count
+        data = [states, actions, rewards, dones, *extra]
         super().__init__(batch_size, data_fn, random, *data)
 
 
@@ -318,11 +332,12 @@ class StateSeqEpDataGenerator(EpDataGenerator):
         self.data[0] = new_states
 
 
-def data_fn(states, actions, rewards, *_):
+def data_fn(states, actions, rewards, *extra):
     states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
     actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
     rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
-    return states, actions, rewards
+    extra = [torch.as_tensor(e).to(cfg.device) for e in extra]
+    return states, actions, rewards, *extra
 
 
 def discount_rewards(rewards, gamma=1.0):
@@ -337,29 +352,54 @@ def discount_rewards(rewards, gamma=1.0):
     return discounted_rewards
 
 
-def normalize_rewards(rewards):
-    return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+def normalize(data):
+    return (data - data.mean()) / (data.std() + 1e-8)
 
 
-def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
+def loss_pg(model, data_loader, states, actions, rewards):
+    dist, values = model(states)
+    log_probs = dist.log_prob(actions)
+    entropy = dist.entropy()
+    values = values.squeeze(1)
+
+    advantages = rewards - values.detach()
+    # do not normalize if random shuffled
+    # advantages = normalize_rewards(advantages)
+    # cum_values = values * 0.99 + rewards * 0.01
+
+    critic_loss = 0.5 * (values - rewards).pow(2).sum() / len(data_loader)
+    actor_loss = -(log_probs * advantages).sum() / data_loader.round_count
+    entropy_loss = -entropy.sum() / len(data_loader)
+    loss = actor_loss + critic_loss + entropy_loss * cfg.c_entropy
+    return critic_loss, actor_loss, entropy_loss, loss
+
+
+def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs):
+    dist, values = model(states)
+    log_probs = dist.log_prob(actions)
+    entropy = dist.entropy()
+    values = values.squeeze(1)
+
+    # todo: normalize?
+    advantages = rewards - values.detach()
+    ratio = (log_probs - old_log_probs).exp()
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
+    actor_loss = -torch.min(surr1, surr2).sum() / len(data_loader)
+
+    critic_loss = 0.5 * (values - rewards).pow(2).sum() / len(data_loader)
+    entropy_loss = -entropy.sum() / len(data_loader)
+    loss = actor_loss + critic_loss + entropy_loss * cfg.c_entropy
+    return critic_loss, actor_loss, entropy_loss, loss
+
+
+def optimise_by_minibatch(model, optimizer, data_loader):
     first_iter = True
     acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
-    for states, actions, rewards, *_ in data_loader.next_batch():
-        dist, values = model(states)
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
-        values = values.squeeze(1)
-
-        advantages = rewards - values.detach()
-        # do not normalize if random shuffled
-        # advantages = normalize_rewards(advantages)
-        # cum_values = values * 0.99 + rewards * 0.01
-
-        critic_loss = 0.5 * (values - rewards).pow(2).sum() / len(data_loader)
-        actor_loss = -(log_prob * advantages).sum() / batch_round_count
-        entropy_loss = -entropy.sum() / len(data_loader)
-        loss = actor_loss + critic_loss + entropy_loss * cfg.c_entropy
+    for states, actions, rewards, dones, *extra in data_loader.next_batch():
+        old_log_probes = extra[0]
+        critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, rewards, old_log_probes)
 
         critic_loss.loss_name = 'critic'
         actor_loss.loss_name = 'actor'
@@ -380,11 +420,11 @@ def optimise_by_minibatch(model, optimizer, data_loader, batch_round_count):
         acc_entropy_loss += entropy_loss
     optimizer.step()
 
-    critic_loss.loss_name = 'critic'
-    actor_loss.loss_name = 'actor'
-    entropy_loss.loss_name = 'entropy'
-    loss.loss_name = 'total'
-    summary_loss(model, optimizer, critic_loss, actor_loss, entropy_loss, loss)
+    acc_critic_loss.loss_name = 'critic'
+    acc_actor_loss.loss_name = 'actor'
+    acc_entropy_loss.loss_name = 'entropy'
+    acc_loss.loss_name = 'total'
+    summary_loss(model, optimizer, acc_critic_loss, acc_actor_loss, acc_entropy_loss, acc_loss)
 
 
 def summary_grad(model, optimizer, *losses):
@@ -465,7 +505,7 @@ def diff_state(state, last_state):
 
 def train_(load_from):
     global writer
-    writer = MySummaryWriter(0, 50, comment=f'.{cfg.model}.{cfg.env_id}')
+    writer = MySummaryWriter(0, cfg.epoch_save // 4, comment=f'.{cfg.model}.{cfg.env_id}')
 
     envs = [lambda: gym.make(cfg.env_id, render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs  # Prepare N actors in N environments
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
@@ -500,11 +540,12 @@ def train_(load_from):
             state_ = collector.peek_batch(cfg.seq_len - 1, state_)
         dist, value = model(torch.FloatTensor(state_).to(cfg.device))
         action = dist.sample()
+        log_prob = dist.log_prob(action)
         action = action.cpu().numpy()
         next_state, reward, done, _ = envs.step(action + 2)
         next_state = batch_prepro(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
-        collector.add(diff_state(state, last_state), action, reward, done)
+        collector.add(diff_state(state, last_state), action, reward, done, log_prob.detach())
         last_state = state
         state = next_state
         # reset last_state to state when done
@@ -519,7 +560,6 @@ def train_(load_from):
 
             # [(states, actions, rewards, ...), ...]
             episodes = collector.roll_batch()
-            batch_round_count = 0
             total_samples = 0
             for i, episode in enumerate(episodes):
                 ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
@@ -529,31 +569,26 @@ def train_(load_from):
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
                 ep_rewards = np.array(ep_rewards)
-                ep_round_count = (ep_rewards != 0).sum()
                 ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
-                # ep_rewards = normalize_rewards(ep_rewards)
+                # ep_rewards = normalize(ep_rewards)
                 ep_rewards = list(ep_rewards)
                 episode[2] = ep_rewards
-                batch_round_count += ep_round_count
                 total_samples += len(ep_rewards)
             avg_reward /= len(episodes)
             writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
 
-            # optimise every 1/4 samples to accelerate training
-            chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
-            # set random True
-            if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-                chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=True)
-            else:
-                chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=True)
-            for chunk in chunk_loader.next_batch():
-                # minibatch don't exceeds cfg.max_batch_size
-                minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
-                optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
-                # if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-                #     optimise_by_minibatch(model, optimizer, minibatch_loader, batch_round_count)
-                # else:
-                #     optimise(model, optimizer, minibatch_loader, batch_round_count)
+            for _ in range(cfg.optimise_times):
+                # optimise every chunk_percent samples to accelerate training
+                chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
+                # set random True
+                if cfg.model_net in ('cnn3d', 'cnn3d2d'):
+                    chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=True)
+                else:
+                    chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=True)
+                for chunk in chunk_loader.next_batch():
+                    # minibatch don't exceeds cfg.max_batch_size
+                    minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
+                    optimise_by_minibatch(model, optimizer, minibatch_loader)
 
             state = envs.reset()
             state = batch_prepro(state)
@@ -632,7 +667,7 @@ def test_state_seq_data_generator():
         [i+1 for i in range(10)],
         [False, False, True, False, False, True, False, False, False, True],
     ]
-    g = StateSeqDataGenerator([episode] * 2, 2, 3, data_fn)
+    g = StateSeqEpDataGenerator([episode] * 2, 2, 3, data_fn)
     assert g.data[0] == [[0, 0, 1], [0, 1, 2], [1, 2, 3], [0, 0, 4], [0, 4, 5], [4, 5, 6], [0, 0, 7], [0, 7, 8], [7, 8, 9], [8, 9, 10], [0, 0, 1], [0, 1, 2], [1, 2, 3], [0, 0, 4], [0, 4, 5], [4, 5, 6], [0, 0, 7], [0, 7, 8], [7, 8, 9], [8, 9, 10]]
 
 
