@@ -97,13 +97,17 @@ class CNNModel(nn.Module):
             # nn.ReLU(),
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
         )
+        self.critic = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=1),
+        )
 
     def forward(self, x: torch.Tensor):
         x = x.permute(0, 3, 1, 2)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
-        return dist
+        value = self.critic(feature)
+        return dist, value
 
 
 class CNN3dModel(nn.Module):
