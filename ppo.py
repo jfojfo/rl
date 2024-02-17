@@ -12,13 +12,13 @@ from torch.distributions import Categorical
 from utils import *
 
 config = {
-    'model_net': 'mlp',  # mlp, cnn, cnn3d
-    'model': 'pg.episode.ppo.mlp',
+    'model_net': 'cnn3d',  # mlp, cnn, cnn3d
+    'model': 'pg.episode.ppo.cnn3d',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pg.episode.ppo.mlp',
+    # 'wandb': 'pg.episode.ppo',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
@@ -35,10 +35,10 @@ config = {
     'chunk_percent': 1/16,  # split into chunks, do optimise per chunk
     'seq_len': 11,
     'epoch_episodes': 10,
-    'epoch_save': 200,
+    'epoch_save': 20,
     'max_epoch': 1000000,
     'target_reward': 20,
-    'diff_state': True,
+    'diff_state': False,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
