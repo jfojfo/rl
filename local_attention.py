@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat, pack, unpack
 
-from local_attention.rotary import SinusoidalEmbeddings, apply_rotary_pos_emb
+from rotary import SinusoidalEmbeddings, apply_rotary_pos_emb
 
 # constant
 
@@ -145,6 +145,12 @@ class LocalAttention(nn.Module):
 
         bq = bq * scale
 
+        # rotary embeddings
+
+        if exists(self.rel_pos):
+            pos_emb, xpos_scale = self.rel_pos(bk)
+            bq, bk = apply_rotary_pos_emb(bq, bk, pos_emb, scale = xpos_scale)
+
         look_around_kwargs = dict(
             backward =  look_backward,
             forward =  look_forward,
@@ -153,12 +159,6 @@ class LocalAttention(nn.Module):
 
         bk = look_around(bk, **look_around_kwargs)
         bv = look_around(bv, **look_around_kwargs)
-
-        # rotary embeddings
-
-        if exists(self.rel_pos):
-            pos_emb, xpos_scale = self.rel_pos(bk)
-            bq, bk = apply_rotary_pos_emb(bq, bk, pos_emb, scale = xpos_scale)
 
         # calculate positions for masking
 
@@ -239,4 +239,22 @@ class LocalAttention(nn.Module):
             out = out[:, :orig_seq_len, :]
 
         out, *_ = unpack(out, packed_shape, '* n d')
+        return out
+
+    # attn_mask: (b, l)
+    def forward_simple(self, q, k, v, attn_mask = None):
+        q = q * (q.shape[-1] ** -0.5)
+        if exists(self.rel_pos):
+            pos_emb, xpos_scale = self.rel_pos(k)
+            q, k = apply_rotary_pos_emb(q, k, pos_emb, scale = xpos_scale)
+
+        sim = einsum('b h i e, b h j e -> b h i j', q, k)
+        if attn_mask is not None:
+            mask = repeat(attn_mask, 'b j -> b h i j', h = sim.shape[1], i = sim.shape[2])
+            mask_value = max_neg_value(sim)
+            sim.masked_fill(~mask, mask_value)
+
+        attn = sim.softmax(dim = -1)
+        attn = self.dropout(attn)
+        out = einsum('b h i j, b h j e -> b h i e', attn, v)
         return out
