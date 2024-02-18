@@ -11,9 +11,10 @@ from torch.distributions import Categorical
 
 from utils import *
 
+
 config = {
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d
-    'model': 'pg.episode.ppo.cnn3d.chunk_1_64',
+    'model': 'pg.episode.ppo.cnn3d',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -39,6 +40,7 @@ config = {
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
+    'shuffle': True,
 }
 cfg = Config(**config)
 writer: MySummaryWriter = None
@@ -398,7 +400,6 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs):
 
 
 def optimise_by_minibatch(model, optimizer, data_loader):
-    summary = {}
     first_iter = True
     acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
@@ -408,7 +409,8 @@ def optimise_by_minibatch(model, optimizer, data_loader):
 
         # summary in the first iteration and zero_grad after that
         if first_iter:
-            summary_grad(summary, model, optimizer, {'critic': critic_loss, 'actor': actor_loss, 'entropy': entropy_loss, 'total': loss})
+            params_feature = model.get_parameter('feature.linear.weight')
+            writer.summary_grad(optimizer, params_feature, {'critic': critic_loss, 'actor': actor_loss, 'entropy': entropy_loss, 'total': loss})
             optimizer.zero_grad()
             first_iter = False
 
@@ -419,30 +421,7 @@ def optimise_by_minibatch(model, optimizer, data_loader):
         acc_actor_loss += actor_loss
         acc_entropy_loss += entropy_loss
     optimizer.step()
-
-    summary_loss(summary, model, optimizer, {'critic': acc_critic_loss, 'actor': acc_actor_loss, 'entropy': acc_entropy_loss, 'total': acc_loss})
-    return summary
-
-
-def summary_grad(summary, model, optimizer, losses):
-    if not writer.check_steps():
-        return
-    params_feature = model.get_parameter('feature.linear.weight')
-    for name, loss in losses.items():
-        optimizer.zero_grad()
-        loss.backward(retain_graph=True)
-        grad_mean = params_feature.grad.mean()
-        summary[f'Grad/{name}'] = grad_mean.item()
-
-
-def summary_loss(summary, model, optimizer, losses):
-    for name, loss in losses.items():
-        summary[f'Loss/{name}'] = loss.item()
-
-
-def write_summary(summary):
-    for k, v in summary.items():
-        writer.add_scalar(k, v, writer.global_step)
+    writer.summary_loss({'critic': acc_critic_loss, 'actor': acc_actor_loss, 'entropy': acc_entropy_loss, 'total': acc_loss})
 
 
 # def optimise(model, optimizer, data_loader, batch_round_count):
@@ -508,7 +487,7 @@ def diff_state(state, last_state):
 def train_(load_from):
     global writer
     writer = MySummaryWriter(0, cfg.epoch_save // 4, comment=f'.{cfg.model}.{cfg.env_id}')
-    writer.add_text("config", str(cfg), 0)
+    writer.summary_script_content(__file__)
 
     envs = [lambda: gym.make(cfg.env_id, render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs  # Prepare N actors in N environments
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
@@ -585,15 +564,15 @@ def train_(load_from):
                 chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
                 # set random True
                 if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-                    chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=True)
+                    chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=cfg.shuffle)
                 else:
-                    chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=True)
+                    chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=cfg.shuffle)
                 for chunk in chunk_loader.next_batch():
                     # minibatch don't exceeds cfg.max_batch_size
                     minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
-                    summary = optimise_by_minibatch(model, optimizer, minibatch_loader)
+                    optimise_by_minibatch(model, optimizer, minibatch_loader)
             # write summary once after optimise_times to prevent duplicate
-            write_summary(summary)
+            writer.write_summary()
 
             state = envs.reset()
             state = batch_prepro(state)

@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from PIL import Image
 import numpy as np
+from PIL import Image
 
 
 normal_repr = torch.Tensor.__repr__
@@ -52,6 +52,7 @@ def grey_crop_resize_batch(state):  # deal with batch observations
     states_array = np.vstack(states) # turn the stack into array
     return states_array # B*C*H*W
 
+
 def grey_crop_resize(state): # deal with single observation
     img = Image.fromarray(state)
     grey_img = img.convert(mode='L')
@@ -71,12 +72,39 @@ class MySummaryWriter(SummaryWriter):
         super().__init__(*args, **kwargs)
         self.global_step = step
         self.steps_to_log = steps_to_log
+        self.summary = {}
 
     def update_global_step(self, global_step):
         self.global_step = global_step
 
     def check_steps(self):
         return self.global_step % self.steps_to_log == 0
+
+    def summary_script_content(self, script_path):
+        with open(script_path, 'r') as script_file:
+            content = script_file.read()
+            content = f'```python\n{content}\n```'
+            self.add_text(script_path, content, self.global_step)
+
+    def summary_grad(self, optimizer, params, losses):
+        if not self.check_steps():
+            return
+        summary = self.summary
+        for name, loss in losses.items():
+            optimizer.zero_grad()
+            loss.backward(retain_graph=True)
+            grad_mean = params.grad.mean()
+            summary[f'Grad/{name}'] = grad_mean.item()
+
+    def summary_loss(self, losses):
+        summary = self.summary
+        for name, loss in losses.items():
+            summary[f'Loss/{name}'] = loss.item()
+
+    def write_summary(self):
+        for k, v in self.summary.items():
+            self.add_scalar(k, v, self.global_step)
+        self.summary = {}
 
 
 def wandb_login():
