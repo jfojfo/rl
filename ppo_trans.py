@@ -2,19 +2,21 @@ import os
 import argparse
 from collections import OrderedDict
 import random
+from einops import rearrange
 import numpy as np
 import torch
 import gymnasium as gym
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from torch import nn, optim
 from torch.distributions import Categorical
+from local_attention import LocalAttention
 
 from utils import *
 
 
 config = {
-    'model_net': 'cnn3d',  # mlp, cnn, cnn3d
-    'model': 'pg.episode.ppo.cnn3d',
+    'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer
+    'model': 'pg.episode.ppo.transformer',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -24,12 +26,25 @@ config = {
     'wandb': None,
     'run_in_notebook': False,
 
-    'n_envs': 8,  # simultaneous processing environments
+    'n_envs': 2,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
     'surr_clip': 0.2,
+
+    'transformer': {
+        'num_blocks': 1,
+        'dim_input': 128,  # dim_head * num_heads
+        'dim_head': 16,
+        'num_heads': 8,
+        'state_dim': 80 * 80,
+        'action_dim': 2,
+        'reward_dim': 1,
+        # 'window_size': 256,  # seq_len - 1
+        'layer_norm': 'pre',  # pre/post
+        'positional_encoding': 'rotary',  # relative/learned/rotary
+    },
 
     'optimise_times': 10,  # optimise times per epoch
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k
@@ -40,9 +55,10 @@ config = {
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
-    'shuffle': True,
+    'shuffle': False,
 }
 cfg = Config(**config)
+cfg.transformer.window_size = cfg.seq_len - 1
 writer: MySummaryWriter = None
 
 
@@ -55,8 +71,179 @@ def get_model():
         return CNN3dModel
     elif cfg.model_net == 'cnn3d2d':
         return CNN3d2dModel
+    elif cfg.model_net == 'transformer':
+        return TransformerModel
     else:
         return MLPModel
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        inner_dim = cfg.dim_head * cfg.num_heads
+        dim = inner_dim
+
+        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+
+        self.attn_fn = LocalAttention(
+            dim = cfg.dim_head,
+            window_size = cfg.window_size,
+            causal = True,
+            autopad = True,
+            exact_windowsize = True,
+        )
+
+        if cfg.layer_norm == "pre":
+            self.norm1 = nn.LayerNorm(dim)
+            self.norm_kv = nn.LayerNorm(dim)
+            self.norm2 = nn.LayerNorm(dim)
+        else:
+            self.norm1 = nn.LayerNorm(dim)
+            self.norm2 = nn.LayerNorm(dim)
+
+        self.to_out = nn.Linear(inner_dim, dim)
+
+    def inference(self, x, mem_kv, mask = None):
+        x_ = x
+
+        if self.cfg.layer_norm == 'pre':
+            x_ = self.norm1(x_)
+
+        q = self.to_q(x_)
+        kv = self.to_kv(x_)
+        q, kv = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.cfg.num_heads), (q, kv))
+        mem_kv = torch.cat([mem_kv, kv], dim=2)
+        k, v = mem_kv.chunk(2, dim = -1)
+
+        h = self.attn_fn.forward_simple(q, k, v, attn_mask=mask)
+        h = rearrange(h, 'b h n d -> b n (h d)')
+        h = h + x
+
+        h_ = h
+
+        if self.cfg.layer_norm == 'pre':
+            h_ = self.norm2(h)
+        elif self.cfg.layer_norm == 'post':
+            h = self.norm1(h)
+            h_ = h
+
+        out = self.to_out(h_)
+        out = out + h
+
+        if self.cfg.layer_norm == 'post':
+            out = self.norm2(out)
+
+        return out, mem_kv
+
+    def forward(self, x, mask = None):
+        x_ = x
+
+        if self.cfg.layer_norm == 'pre':
+            x_ = self.norm1(x_)
+            mem = self.norm_kv(mem)
+
+        q = self.to_q(x_)
+        k, v = self.to_kv(mem).chunk(2, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.cfg.num_heads), (q, k, v))
+
+        h = self.attn_fn(q, k, v, mask = mask)
+        h = h + x
+
+        h_ = h
+
+        if self.cfg.layer_norm == 'pre':
+            h_ = self.norm2(h)
+        elif self.cfg.layer_norm == 'post':
+            h = self.norm1(h)
+            h_ = h
+
+        h_ = rearrange(h_, 'b h n d -> b n (h d)')
+        out = self.to_out(h_)
+        out = out + h
+
+        if self.cfg.layer_norm == 'post':
+            out = self.norm2(out)
+
+        return out
+
+
+class TransformerModel(nn.Module):
+    def __init__(self, cfg, num_outputs):
+        super().__init__()
+        cfg = cfg.transformer
+        self.cfg = cfg
+        # memory is needed by inference
+        self.memory = [Memory(cfg.window_size) for _ in range(cfg.num_blocks)]
+
+        self.state_embedding = nn.Sequential(OrderedDict([
+            ('flatten', nn.Flatten(start_dim=2)),
+            ('linear', nn.Linear(in_features=cfg.state_dim, out_features=cfg.dim_input)),
+        ]))
+
+        assert cfg.num_blocks > 0
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(cfg)
+            for _ in range(cfg.num_blocks)])
+
+        self.actor = nn.Sequential(
+            nn.Linear(in_features=cfg.dim_input, out_features=num_outputs),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(in_features=cfg.dim_input, out_features=1),
+        )
+
+    def clear_memory(self):
+        for m in self.memory:
+            m.clear()
+
+    def inference(self, x, mask = None):
+        h = self.state_embedding(x)
+
+        for i, block in enumerate(self.transformer_blocks):
+            mem_kv = self.memory[i].get()
+            mask_size = 1 if mem_kv.shape[0] == 0 else mem_kv.shape[-2] + 1
+            h, mem_kv = block.inference(h, mem_kv, mask[:, -mask_size:])
+            self.memory[i].set(mem_kv)
+
+        h = h.squeeze(1)
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        value = self.critic(h)
+        return dist, value
+
+    def forward(self, x, dones):
+        h = self.state_embedding(x)
+
+        # self.memory[0].append(x)
+        # for i, block in enumerate(self.transformer_blocks):
+        #     h = block(h, self.memory[i].get())
+        #     self.memory[i + 1].add(h.detach())
+
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        value = self.critic(h)
+        return dist, value
+
+
+class Memory:
+    def __init__(self, size):
+        self.size = size
+        self.mem = torch.tensor([])
+
+    def get(self):
+        return self.mem
+
+    def set(self, mem):
+        self.mem = mem[..., -self.size:, :]
+
+    def add(self, data):
+        if self.mem is None:
+            self.mem = data.clone()
+        else:
+            self.mem = torch.cat([self.mem, data], dim=1)  # along sequence dim
+            self.mem = self.mem[..., -self.size:, :]
 
 
 class MLPModel(nn.Module):
@@ -252,17 +439,37 @@ class BatchEpisodeCollector:
             self.episode_collectors[i].clear_pending()
             self.episode_collectors[i].clear_episodes()
 
-    def peek_batch(self, seq_len, state):
-        new_state = []
+    def peek_batch(self, seq_len, index, padding=0):
+        new_data = []
         for i in range(self.n):
-            seq_state, *_ = self.episode_collectors[i].peek(seq_len)
-            d = seq_len - len(seq_state)
+            pack = self.episode_collectors[i].peek(seq_len)
+            seq_data = pack[index]
+            d = seq_len - len(seq_data)
             if d > 0:
-                seq_state = [state[i] - state[i]] * d + seq_state
-            assert len(seq_state) == seq_len
-            seq_state.append(state[i])
-            new_state.append(seq_state)
-        return np.array(new_state)
+                seq_data = [padding] * d + seq_data
+            assert len(seq_data) == seq_len
+            new_data.append(seq_data)
+        return np.array(new_data)
+
+    def peek_state(self, seq_len, state):
+        seq_state = self.peek_batch(seq_len - 1, 0, state[0] - state[0])
+        seq_state = np.concatenate([seq_state, state[:, np.newaxis, ...]], 1)
+        assert seq_state.shape[1] == seq_len
+        return seq_state
+
+    def peek_mask(self, seq_len):
+        # some episode may not collect enough data
+        seq_done = self.peek_batch(seq_len - 1, 3, True)
+        b, l = seq_done.shape
+        done = np.array([False] * b).reshape([b, 1])
+        seq_done = np.concatenate([seq_done, done], 1)
+        assert seq_done.shape[1] == seq_len
+
+        mask = 1 - seq_done
+        mask = mask[:, ::-1]
+        mask = np.minimum.accumulate(mask, 1)
+        mask = mask[:, ::-1]
+        return mask.copy()  # return copy to prevent reverse index error when converting torch tensor
 
 
 class BaseGenerator:
@@ -519,8 +726,13 @@ def train_(load_from):
     while not early_stop and epoch < cfg.max_epoch:
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-            state_ = collector.peek_batch(cfg.seq_len - 1, state_)
-        dist, value = model(torch.FloatTensor(state_).to(cfg.device))
+            state_ = collector.peek_state(cfg.seq_len, state_)
+        if cfg.model_net == 'transformer':
+            mask = collector.peek_mask(cfg.seq_len)
+            dist, value = model.inference(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
+                                          torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
+        else:
+            dist, value = model(state_)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         action = action.cpu().numpy()
@@ -605,8 +817,8 @@ def test_env(env, model):
     while not done:
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-            state_ = collector.peek_batch(cfg.seq_len - 1, [state_])
-        dist, value = model(torch.FloatTensor(state_).to(cfg.device))
+            state_ = collector.peek_state(cfg.seq_len, [state_])
+        dist, value = model(state_)
         # dist = model(torch.FloatTensor(diff_state(state, last_state)).unsqueeze(0).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()[0]
