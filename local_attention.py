@@ -145,12 +145,6 @@ class LocalAttention(nn.Module):
 
         bq = bq * scale
 
-        # rotary embeddings
-
-        if exists(self.rel_pos):
-            pos_emb, xpos_scale = self.rel_pos(bk)
-            bq, bk = apply_rotary_pos_emb(bq, bk, pos_emb, scale = xpos_scale)
-
         look_around_kwargs = dict(
             backward =  look_backward,
             forward =  look_forward,
@@ -159,6 +153,12 @@ class LocalAttention(nn.Module):
 
         bk = look_around(bk, **look_around_kwargs)
         bv = look_around(bv, **look_around_kwargs)
+
+        # rotary embeddings
+
+        if exists(self.rel_pos):
+            pos_emb, xpos_scale = self.rel_pos(bk)
+            bq, bk = apply_rotary_pos_emb(bq, bk, pos_emb, scale = xpos_scale)
 
         # calculate positions for masking
 
