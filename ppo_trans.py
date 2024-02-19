@@ -105,7 +105,7 @@ class TransformerBlock(nn.Module):
 
         self.to_out = nn.Linear(inner_dim, dim)
 
-    def inference(self, x, mem_kv, mask = None):
+    def forward(self, x, mem_kv, mask = None, mode = 'inference'):
         x_ = x
 
         if self.cfg.layer_norm == 'pre':
@@ -117,7 +117,10 @@ class TransformerBlock(nn.Module):
         mem_kv = torch.cat([mem_kv, kv], dim=2)
         k, v = mem_kv.chunk(2, dim = -1)
 
-        h = self.attn_fn.forward_simple(q, k, v, attn_mask=mask)
+        if mode == 'inference':
+            h = self.attn_fn.forward_simple(q, k, v, attn_mask=mask)
+        else:
+            h = self.attn_fn(q, k, v)
         h = rearrange(h, 'b h n d -> b n (h d)')
         h = h + x
 
@@ -136,37 +139,6 @@ class TransformerBlock(nn.Module):
             out = self.norm2(out)
 
         return out, mem_kv
-
-    def forward(self, x, mask = None):
-        x_ = x
-
-        if self.cfg.layer_norm == 'pre':
-            x_ = self.norm1(x_)
-            mem = self.norm_kv(mem)
-
-        q = self.to_q(x_)
-        k, v = self.to_kv(mem).chunk(2, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.cfg.num_heads), (q, k, v))
-
-        h = self.attn_fn(q, k, v, mask = mask)
-        h = h + x
-
-        h_ = h
-
-        if self.cfg.layer_norm == 'pre':
-            h_ = self.norm2(h)
-        elif self.cfg.layer_norm == 'post':
-            h = self.norm1(h)
-            h_ = h
-
-        h_ = rearrange(h_, 'b h n d -> b n (h d)')
-        out = self.to_out(h_)
-        out = out + h
-
-        if self.cfg.layer_norm == 'post':
-            out = self.norm2(out)
-
-        return out
 
 
 class TransformerModel(nn.Module):
@@ -198,29 +170,19 @@ class TransformerModel(nn.Module):
         for m in self.memory:
             m.clear()
 
-    def inference(self, x, mask = None):
+    def forward(self, x, mask = None, mode = 'inference'):
         h = self.state_embedding(x)
 
         for i, block in enumerate(self.transformer_blocks):
-            mem_kv = self.memory[i].get()
-            mask_size = 1 if mem_kv.shape[0] == 0 else mem_kv.shape[-2] + 1
-            h, mem_kv = block.inference(h, mem_kv, mask[:, -mask_size:])
-            self.memory[i].set(mem_kv)
+            if mode == 'inference':
+                mem_kv = self.memory[i].get()
+                mask_size = 1 if self.memory[i].is_empty() else (mem_kv.shape[-2] + 1)
+                h, mem_kv = block(h, mem_kv, mask[:, -mask_size:], mode)
+                self.memory[i].set(mem_kv)
+            else:
+                h, _ = block(h, Memory.get_empty_mem(), mode=mode)
 
         h = h.squeeze(1)
-        logits = self.actor(h)
-        dist = Categorical(logits=logits)
-        value = self.critic(h)
-        return dist, value
-
-    def forward(self, x, dones):
-        h = self.state_embedding(x)
-
-        # self.memory[0].append(x)
-        # for i, block in enumerate(self.transformer_blocks):
-        #     h = block(h, self.memory[i].get())
-        #     self.memory[i + 1].add(h.detach())
-
         logits = self.actor(h)
         dist = Categorical(logits=logits)
         value = self.critic(h)
@@ -230,7 +192,11 @@ class TransformerModel(nn.Module):
 class Memory:
     def __init__(self, size):
         self.size = size
-        self.mem = torch.tensor([])
+        self.mem = self.get_empty_mem()
+
+    @staticmethod
+    def get_empty_mem():
+        return torch.tensor([]).to(cfg.device)
 
     def get(self):
         return self.mem
@@ -238,12 +204,18 @@ class Memory:
     def set(self, mem):
         self.mem = mem[..., -self.size:, :]
 
-    def add(self, data):
-        if self.mem is None:
-            self.mem = data.clone()
-        else:
-            self.mem = torch.cat([self.mem, data], dim=1)  # along sequence dim
-            self.mem = self.mem[..., -self.size:, :]
+    def clear(self):
+        self.mem = self.get_empty_mem()
+
+    def is_empty(self):
+        return self.mem.shape[0] == 0
+
+    # def add(self, data):
+    #     if self.mem.shape[0] == 0:
+    #         self.mem = data.clone()
+    #     else:
+    #         self.mem = torch.cat([self.mem, data], dim=1)  # along sequence dim
+    #         self.mem = self.mem[..., -self.size:, :]
 
 
 class MLPModel(nn.Module):
@@ -588,7 +560,10 @@ def loss_pg(model, data_loader, states, actions, rewards):
 
 
 def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs):
-    dist, values = model(states)
+    if cfg.model_net == 'transformer':
+        dist, values = model(states, mode='train')
+    else:
+        dist, values = model(states)
     log_probs = dist.log_prob(actions)
     entropy = dist.entropy()
     values = values.squeeze(1)
@@ -729,8 +704,8 @@ def train_(load_from):
             state_ = collector.peek_state(cfg.seq_len, state_)
         if cfg.model_net == 'transformer':
             mask = collector.peek_mask(cfg.seq_len)
-            dist, value = model.inference(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
-                                          torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
+            dist, value = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
+                                torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
         else:
             dist, value = model(state_)
         action = dist.sample()
@@ -790,6 +765,8 @@ def train_(load_from):
             state = batch_prepro(state)
             last_state = state.copy()
             collector.clear_all()
+            if cfg.model_net == 'transformer':
+                model.clear_memory()
 
             if epoch % cfg.epoch_save == 0:
                 name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, cum_reward, epoch)
