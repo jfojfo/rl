@@ -2,14 +2,16 @@ import os
 import argparse
 from collections import OrderedDict
 import random
-from einops import rearrange
+from einops import rearrange, repeat
 import numpy as np
 import torch
 import gymnasium as gym
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from torch import nn, optim
+from torch import einsum, nn, optim
 from torch.distributions import Categorical
 from local_attention import LocalAttention
+from local_attention.rotary import apply_rotary_pos_emb
+
 
 from utils import *
 
@@ -21,12 +23,12 @@ config = {
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pg.episode.ppo',
+    # 'wandb': 'pg.episode.ppo.transformer',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
 
-    'n_envs': 2,  # simultaneous processing environments
+    'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_entropy': 0.0,  # entropy coefficient
@@ -47,7 +49,7 @@ config = {
     },
 
     'optimise_times': 10,  # optimise times per epoch
-    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k
+    'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
     'seq_len': 11,
     'epoch_episodes': 10,
@@ -77,6 +79,26 @@ def get_model():
         return MLPModel
 
 
+class MyLocalAttention(LocalAttention):
+    # attn_mask: (b, l)
+    def forward_simple(self, q, k, v, attn_mask = None):
+        q = q * (q.shape[-1] ** -0.5)
+        if self.rel_pos is not None:
+            pos_emb, xpos_scale = self.rel_pos(k)
+            q, k = apply_rotary_pos_emb(q, k, pos_emb, scale = xpos_scale)
+
+        sim = einsum('b h i e, b h j e -> b h i j', q, k)
+        if attn_mask is not None:
+            mask = repeat(attn_mask, 'b j -> b h i j', h = sim.shape[1], i = sim.shape[2])
+            mask_value = -torch.finfo(sim.dtype).max
+            sim.masked_fill(~mask, mask_value)
+
+        attn = sim.softmax(dim = -1)
+        attn = self.dropout(attn)
+        out = einsum('b h i j, b h j e -> b h i e', attn, v)
+        return out
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -87,7 +109,7 @@ class TransformerBlock(nn.Module):
         self.to_q = nn.Linear(dim, inner_dim, bias = False)
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
 
-        self.attn_fn = LocalAttention(
+        self.attn_fn = MyLocalAttention(
             dim = cfg.dim_head,
             window_size = cfg.window_size,
             causal = True,
@@ -149,7 +171,7 @@ class TransformerModel(nn.Module):
         # memory is needed by inference
         self.memory = [Memory(cfg.window_size) for _ in range(cfg.num_blocks)]
 
-        self.state_embedding = nn.Sequential(OrderedDict([
+        self.feature = nn.Sequential(OrderedDict([
             ('flatten', nn.Flatten(start_dim=2)),
             ('linear', nn.Linear(in_features=cfg.state_dim, out_features=cfg.dim_input)),
         ]))
@@ -170,8 +192,9 @@ class TransformerModel(nn.Module):
         for m in self.memory:
             m.clear()
 
-    def forward(self, x, mask = None, mode = 'inference'):
-        h = self.state_embedding(x)
+    # mode: inference/train
+    def forward(self, x, mask = None, mode = 'inference', lookback = 0):
+        h = self.feature(x)
 
         for i, block in enumerate(self.transformer_blocks):
             if mode == 'inference':
@@ -182,7 +205,11 @@ class TransformerModel(nn.Module):
             else:
                 h, _ = block(h, Memory.get_empty_mem(), mode=mode)
 
-        h = h.squeeze(1)
+        if mode == 'inference':
+            h = h.squeeze(1)
+        else:
+            h = h.squeeze(0)
+            h = h[lookback:, ...]
         logits = self.actor(h)
         dist = Categorical(logits=logits)
         value = self.critic(h)
@@ -517,6 +544,68 @@ class StateSeqEpDataGenerator(EpDataGenerator):
         self.data[0] = new_states
 
 
+class LookBackEpDataGenerator(EpDataGenerator):
+    def __init__(self, episodes, batch_size, lookback, data_fn):
+        super().__init__(episodes, batch_size, data_fn, False)
+        self.lookback = lookback
+
+    def next_batch(self):
+        for i in range(0, len(self), self.batch_size):
+            lookback_ = min(i, self.lookback)
+            batch = self.data_fn(*[d[i - lookback_:i + self.batch_size] for d in self.data])
+            batch = list(batch)
+            batch.append(lookback_)
+            yield batch
+
+
+class LookBackSeqDataGenerator(BaseGenerator):
+    """_summary_
+
+    Args:
+        lookback: window size
+        offset: where first data starting from
+    """
+    def __init__(self, batch_size, lookback, offset, data_fn, *data):
+        super().__init__(batch_size, data_fn, False, *data)
+        self.lookback = lookback
+        self.offset = offset
+
+    def next_batch(self):
+        dones = self.data[3]
+        total = len(self)
+        last_done, curr_done = -1, -1
+        for i in range(self.offset):
+            if dones[i]:
+                last_done = i
+        i, start = self.offset, self.offset
+        end = min(start + self.batch_size, total)
+        while True:
+            if i == end:
+                # look back window size
+                lookback_pos = max(0, start - self.lookback)
+                lookback_pos = max(lookback_pos, last_done + 1)
+                # only lookback for states
+                batch = self.data_fn(*[d[lookback_pos:end] if j == 0 else d[start:end] for j, d in enumerate(self.data)])
+                batch = list(batch)
+                # strip size
+                batch.append(start - lookback_pos)
+                yield batch
+
+                if i >= total:
+                    assert i == total
+                    break
+
+                start = end
+                end = min(start + self.batch_size, total)
+                if curr_done != -1:
+                    last_done = curr_done
+                curr_done = -1
+            if dones[i]:
+                end = i + 1
+                curr_done = i
+            i += 1
+
+
 def data_fn(states, actions, rewards, *extra):
     states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
     actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
@@ -559,9 +648,9 @@ def loss_pg(model, data_loader, states, actions, rewards):
     return critic_loss, actor_loss, entropy_loss, loss
 
 
-def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs):
+def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, lookback=0):
     if cfg.model_net == 'transformer':
-        dist, values = model(states, mode='train')
+        dist, values = model(states.unsqueeze(0), mode='train', lookback=lookback)
     else:
         dist, values = model(states)
     log_probs = dist.log_prob(actions)
@@ -586,8 +675,7 @@ def optimise_by_minibatch(model, optimizer, data_loader):
     acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
     for states, actions, rewards, dones, *extra in data_loader.next_batch():
-        old_log_probes = extra[0]
-        critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, rewards, old_log_probes)
+        critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, rewards, *extra)
 
         # summary in the first iteration and zero_grad after that
         if first_iter:
@@ -749,14 +837,19 @@ def train_(load_from):
             for _ in range(cfg.optimise_times):
                 # optimise every chunk_percent samples to accelerate training
                 chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
-                # set random True
-                if cfg.model_net in ('cnn3d', 'cnn3d2d'):
+                if cfg.model_net == 'transformer':
+                    chunk_loader = LookBackEpDataGenerator(episodes, chunk_size, cfg.transformer.window_size, lambda *d: d)
+                elif cfg.model_net in ('cnn3d', 'cnn3d2d'):
                     chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=cfg.shuffle)
                 else:
                     chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=cfg.shuffle)
+
                 for chunk in chunk_loader.next_batch():
                     # minibatch don't exceeds cfg.max_batch_size
-                    minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
+                    if cfg.model_net == 'transformer':
+                        minibatch_loader = LookBackSeqDataGenerator(cfg.max_batch_size, cfg.transformer.window_size, chunk[-1], data_fn, *chunk[:-1])
+                    else:
+                        minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
                     optimise_by_minibatch(model, optimizer, minibatch_loader)
             # write summary once after optimise_times to prevent duplicate
             writer.write_summary()
@@ -833,7 +926,7 @@ def eval(load_from=None):
         print(f"steps {steps}, reward {reward}")
 
 
-def test_state_seq_data_generator():
+def test_StateSeqEpDataGenerator():
     episode = [
         [i+1 for i in range(10)],
         [i+1 for i in range(10)],
@@ -842,6 +935,59 @@ def test_state_seq_data_generator():
     ]
     g = StateSeqEpDataGenerator([episode] * 2, 2, 3, data_fn)
     assert g.data[0] == [[0, 0, 1], [0, 1, 2], [1, 2, 3], [0, 0, 4], [0, 4, 5], [4, 5, 6], [0, 0, 7], [0, 7, 8], [7, 8, 9], [8, 9, 10], [0, 0, 1], [0, 1, 2], [1, 2, 3], [0, 0, 4], [0, 4, 5], [4, 5, 6], [0, 0, 7], [0, 7, 8], [7, 8, 9], [8, 9, 10]]
+
+
+def test_LookBackSeqDataGenerator():
+    data = [[False, False, False, False, True, False, False, True, False, True]] * 4
+    g = LookBackSeqDataGenerator(2, 2, 0, data_fn, *data)
+    iter = g.next_batch()
+    v = next(iter)
+    assert v[0].tolist() == [False, False]
+    v = next(iter)
+    assert v[0].tolist() == [False, False, False, False]
+    v = next(iter)
+    assert v[0].tolist() == [False, False, True]
+    v = next(iter)
+    assert v[0].tolist() == [False, False]
+    v = next(iter)
+    assert v[0].tolist() == [False, False, True]
+    v = next(iter)
+    assert v[0].tolist() == [False, True]
+    
+    data = [[False, False, False, False, False, False, False, False, False, False]] * 4
+    g = LookBackSeqDataGenerator(6, 3, 0, data_fn, *data)
+    iter = g.next_batch()
+    _, v = next(iter), next(iter)
+    assert v[0].tolist() == [False, False, False, False, False, False, False]
+
+    data = [[True, True, False, False, False, False, False, False, True]] * 4
+    g = LookBackSeqDataGenerator(2, 3, 0, data_fn, *data)
+    iter = g.next_batch()
+    v = next(iter)
+    assert v[0].tolist() == [True]
+    v = next(iter)
+    assert v[0].tolist() == [True]
+    _, v = next(iter), next(iter)
+    assert v[0].tolist() == [False, False, False, False]
+    v = next(iter)
+    assert v[0].tolist() == [False, False, False, False, False]
+    v = next(iter)
+    assert v[0].tolist() == [False, False, False, True]
+
+    data = [[True, False, False, False, False, False, False, False, False]] * 4
+    g = LookBackSeqDataGenerator(4, 3, 2, data_fn, *data)
+    iter = g.next_batch()
+    v = next(iter)
+    assert v[0].tolist() == [False, False, False, False, False]
+    v = next(iter)
+    assert v[0].tolist() == [False, False, False, False, False, False]
+
+    data = [[False, False, False, False, False, False, False, False, False]] * 4
+    g = LookBackSeqDataGenerator(4, 3, 3, data_fn, *data)
+    iter = g.next_batch()
+    v = next(iter)
+    assert v[0].tolist() == [False, False, False, False, False, False, False]
+    v = next(iter)
 
 
 if __name__ == "__main__":
