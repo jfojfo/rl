@@ -388,6 +388,7 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs):
 
     # todo: normalize?
     advantages = rewards - values.detach()
+    # advantages = normalize(advantages)
     ratio = (log_probs - old_log_probs).exp()
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
