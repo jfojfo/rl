@@ -17,8 +17,8 @@ from utils import *
 
 
 config = {
-    'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.transformer',
+    'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer
+    'model': 'pg.episode.ppo.cnn3d.reward_episodely.norm_advantage',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -49,7 +49,7 @@ config = {
     },
 
     'optimise_times': 10,  # optimise times per epoch
-    'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
+    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
     'seq_len': 11,
     'epoch_episodes': 10,
@@ -57,7 +57,7 @@ config = {
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
-    'shuffle': False,
+    'shuffle': True,
 }
 cfg = Config(**config)
 cfg.transformer.window_size = cfg.seq_len - 1
@@ -614,13 +614,25 @@ def data_fn(states, actions, rewards, *extra):
     return states, actions, rewards, *extra
 
 
-def discount_rewards(rewards, gamma=1.0):
+def discount_rewards_roundly(rewards, gamma=1.0):
     # discounted_rewards = [0] * len(rewards)
     discounted_rewards = np.zeros_like(rewards)
     cum_reward = 0
     for i in reversed(range(len(rewards))):
         if rewards[i] != 0:
             cum_reward = 0  # reset the sum, since this was a game boundary (pong specific!)
+        cum_reward = rewards[i] + gamma * cum_reward
+        discounted_rewards[i] = cum_reward
+    return discounted_rewards
+
+
+def discount_rewards(rewards, gamma=1.0):
+    # discounted_rewards = [0] * len(rewards)
+    discounted_rewards = np.zeros_like(rewards)
+    cum_reward = 0
+    for i in reversed(range(len(rewards))):
+        # if rewards[i] != 0:
+        #     cum_reward = 0  # reset the sum, since this was a game boundary (pong specific!)
         cum_reward = rewards[i] + gamma * cum_reward
         discounted_rewards[i] = cum_reward
     return discounted_rewards
@@ -659,6 +671,7 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, lookba
 
     # todo: normalize?
     advantages = rewards - values.detach()
+    advantages = normalize(advantages)
     ratio = (log_probs - old_log_probs).exp()
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
@@ -796,6 +809,7 @@ def train_(load_from):
             dist, value = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
                                 torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
         else:
+            state_ = torch.FloatTensor(state_).to(cfg.device)
             dist, value = model(state_)
         action = dist.sample()
         log_prob = dist.log_prob(action)
