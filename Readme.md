@@ -27,6 +27,10 @@
 
 <img src="img/pg.jpg" height="200">
 
+【cnn模型】loss除以round数，没有mlp好
+
+<img src="img/pg.cnn.jpg" height="200">
+
 【cnn3d模型】对比mlp，从step看爬升很快，从训练时间看差别不大，得分看上去在0徘徊
 
 | cnn3d | cnn3d vs mlp(steps对比) | cnn3d vs mlp(relative time对比) |
@@ -62,7 +66,7 @@ actor-critic，critic预测得分
 
 使用ppo后，训练速度明显加快，2小时差不多训练好
 
-【mlp】
+【mlp】得分不好
 
 [wandb](https://wandb.ai/jfojfo/pg.episode.ppo.mlp/runs/nyoqfptu)
 
@@ -83,12 +87,13 @@ actor-critic，critic预测得分
 
 ### ppo with transformer
 
-transformer输入数据序列长度，为lookback长度再加1个当前状态
+transformer输入数据序列长度，等于lookback长度再加1个当前状态
 
 | lookback 10 | 序列长度256([wandb](https://wandb.ai/jfojfo/pg.episode.ppo.transformer/runs/wc75ve4z?workspace=user-jfojfo)) |
 |----|----|
 | <img src="img/ppo.transformer.look_back_10.jpg" alt="序列长度10" height="200"> | <img src="img/ppo.transformer.look_back_256.jpg" alt="序列长度256" height="200"> |
 
+序列长度256训练时间有限，没有训练更多steps
 
 ## 实现说明
 网上常见ppo算法实现，一般采样固定步数的数据，由于无法提前得知最终得分，使用贝尔曼方程基于下一个状态、当前reward，打折后计算出当前状态的得分值，进行值函数训练，进而辅助策略函数训练。之前在这个Github库[rl-old](https://github.com/jfojfo/rl-old) 做过一些实验。
