@@ -503,9 +503,9 @@ class EpDataGenerator(BaseGenerator):
         extra = []
         round_count = 0
         for episode in episodes:
+            # ep_rewards is original rewards, discount rewards are in extra
             ep_states, ep_actions, ep_rewards, ep_dones, *ep_extra = episode
-            t = np.array(ep_rewards)
-            round_count += np.sum(t == 1) + np.sum(t == -1)
+            round_count += (np.array(ep_rewards) != 0).sum().item()
             states.extend(ep_states)
             actions.extend(ep_actions)
             rewards.extend(ep_rewards)
@@ -524,9 +524,12 @@ class StateSeqEpDataGenerator(EpDataGenerator):
         self.seq_len = seq_len
         new_states = []
         states = self.data[0]
-        dones = self.data[3]
+        # dones = self.data[3]
+        rewards = self.data[2]
         last_done_index = -1
-        for i, done in enumerate(dones):
+        for i, reward in enumerate(rewards):
+            # reward boundery
+            done = reward != 0
             end = i + 1
             j = end - seq_len
             start = max(0, j)
@@ -732,8 +735,8 @@ def optimise_by_minibatch(model, optimizer, data_loader):
     first_iter = True
     acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
-    for states, actions, rewards, dones, *extra in data_loader.next_batch():
-        critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, rewards, *extra)
+    for states, actions, rewards, dones, discount_rewards, *extra in data_loader.next_batch():
+        critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, discount_rewards, *extra)
 
         # summary in the first iteration and zero_grad after that
         if first_iter:
@@ -888,10 +891,11 @@ def train_(load_from):
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
                 ep_rewards = np.array(ep_rewards)
-                ep_rewards = discount_gae(ep_rewards, ep_values, cfg.gamma, cfg.lam)
+                ep_discount_rewards = discount_gae(ep_rewards, ep_values, cfg.gamma, cfg.lam)
                 # ep_rewards = normalize(ep_rewards)
-                ep_rewards = list(ep_rewards)
-                episode[2] = ep_rewards
+                # ep_rewards = list(ep_rewards)
+                # episode[2] = ep_rewards
+                episode.insert(4, list(ep_discount_rewards))
                 total_samples += len(ep_rewards)
             avg_reward /= len(episodes)
             writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
@@ -998,7 +1002,7 @@ def test_StateSeqEpDataGenerator():
     episode = [
         [i+1 for i in range(10)],
         [i+1 for i in range(10)],
-        [i+1 for i in range(10)],
+        [False, False, True, False, False, True, False, False, False, True],
         [False, False, True, False, False, True, False, False, False, True],
     ]
     g = StateSeqEpDataGenerator([episode] * 2, 2, 3, data_fn)
