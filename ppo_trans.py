@@ -18,12 +18,12 @@ from utils import *
 
 config = {
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.cnn3d.reward_episodely.norm_advantage',
+    'model': 'pg.episode.ppo.cnn3d.gae.lam_1',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pg.episode.ppo.transformer',
+    # 'wandb': 'pg.episode.ppo.cnn3d.gae',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
@@ -31,8 +31,10 @@ config = {
     'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
+    'c_critic': 1.0,  # critic coefficient
     'c_entropy': 0.0,  # entropy coefficient
     'gamma': 0.99,
+    'lam': 1.0,
     'surr_clip': 0.2,
 
     'transformer': {
@@ -626,16 +628,58 @@ def discount_rewards_roundly(rewards, gamma=1.0):
     return discounted_rewards
 
 
-def discount_rewards(rewards, gamma=1.0):
-    # discounted_rewards = [0] * len(rewards)
+def discount_rewards_episodely(rewards, gamma=1.0):
     discounted_rewards = np.zeros_like(rewards)
     cum_reward = 0
     for i in reversed(range(len(rewards))):
         # if rewards[i] != 0:
-        #     cum_reward = 0  # reset the sum, since this was a game boundary (pong specific!)
+        #     cum_reward = 0
         cum_reward = rewards[i] + gamma * cum_reward
         discounted_rewards[i] = cum_reward
     return discounted_rewards
+
+
+def discount_gae(rewards, values, gamma=0.99, lam=0.95):
+    returns = np.zeros_like(rewards)
+    gae = 0
+    next_value = 0
+    for i in reversed(range(len(rewards))):
+        if rewards[i] != 0:
+            gae = 0
+        delta = rewards[i] + gamma * next_value - values[i]
+        gae = delta + lam * gamma * gae
+        returns[i] = values[i] + gae
+        next_value = values[i]
+    return returns
+
+
+# def discount_gae(rewards, values, gamma=0.99, lam=0.95):
+#     advantages = np.zeros_like(rewards)
+#     cum_gae = 0
+#     next_value = 0
+#     for i in reversed(range(len(rewards))):
+#         if rewards[i] != 0:
+#             cum_gae = 0
+#         delta = rewards[i] + gamma * next_value - values[i]
+#         cum_gae = delta + lam * gamma * cum_gae
+#         next_value = values[i]
+#         advantages[i] = cum_gae
+#     return advantages
+
+
+# def discount_gae2(rewards, values, gamma=0.99, lam=0.95):
+#     advantages = np.zeros_like(rewards)
+#     cum_gae = 0
+#     next_value = 0
+#     for i in reversed(range(len(rewards))):
+#         if rewards[i] != 0:
+#             cum_gae = 0
+#             next_value = 0
+#         delta = rewards[i] + gamma * next_value - values[i]
+#         cum_gae = delta + lam * gamma * cum_gae
+#         next_value = values[i]
+#         advantages[i] = cum_gae
+#     return advantages
 
 
 def normalize(data):
@@ -679,7 +723,7 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, lookba
 
     critic_loss = 0.5 * (values - rewards).pow(2).sum() / len(data_loader)
     entropy_loss = -entropy.sum() / len(data_loader)
-    loss = actor_loss + critic_loss + entropy_loss * cfg.c_entropy
+    loss = actor_loss + critic_loss * cfg.c_critic + entropy_loss * cfg.c_entropy
     return critic_loss, actor_loss, entropy_loss, loss
 
 
@@ -772,6 +816,8 @@ def train_(load_from):
     writer = MySummaryWriter(0, cfg.epoch_save // 4, comment=f'.{cfg.model}.{cfg.env_id}')
     if not cfg.run_in_notebook:
         writer.summary_script_content(__file__)
+    else:
+        writer.summary_text('', f'```python\n{In[-1]}\n```')
 
     envs = [lambda: gym.make(cfg.env_id, render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs  # Prepare N actors in N environments
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
@@ -817,7 +863,7 @@ def train_(load_from):
         next_state, reward, done, _ = envs.step(action + 2)
         next_state = batch_prepro(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
 
-        collector.add(diff_state(state, last_state), action, reward, done, log_prob.detach())
+        collector.add(diff_state(state, last_state), action, reward, done, log_prob.detach(), value.detach())
         last_state = state
         state = next_state
         # reset last_state to state when done
@@ -834,14 +880,14 @@ def train_(load_from):
             episodes = collector.roll_batch()
             total_samples = 0
             for i, episode in enumerate(episodes):
-                ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
+                ep_states, ep_actions, ep_rewards, ep_dones, ep_values, *_ = episode
                 ep_reward_sum, ep_steps = sum(ep_rewards), len(ep_rewards)
                 avg_reward += ep_reward_sum
                 cum_reward = ep_reward_sum if cum_reward is None else cum_reward * 0.99 + ep_reward_sum * 0.01
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
                 ep_rewards = np.array(ep_rewards)
-                ep_rewards = discount_rewards(ep_rewards, cfg.gamma)
+                ep_rewards = discount_gae(ep_rewards, ep_values, cfg.gamma, cfg.lam)
                 # ep_rewards = normalize(ep_rewards)
                 ep_rewards = list(ep_rewards)
                 episode[2] = ep_rewards
@@ -902,8 +948,14 @@ def test_env(env, model):
     while not done:
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-            state_ = collector.peek_state(cfg.seq_len, [state_])
-        dist, value = model(state_)
+            state_ = collector.peek_state(cfg.seq_len, state_[np.newaxis, ...])
+        if cfg.model_net == 'transformer':
+            mask = collector.peek_mask(cfg.seq_len)
+            dist, value = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
+                                torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
+        else:
+            state_ = torch.FloatTensor(state_).to(cfg.device)
+            dist, value = model(state_)
         # dist = model(torch.FloatTensor(diff_state(state, last_state)).unsqueeze(0).to(cfg.device))
         action = dist.sample()
         action = action.cpu().numpy()[0]
