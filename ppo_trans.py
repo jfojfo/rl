@@ -524,12 +524,9 @@ class StateSeqEpDataGenerator(EpDataGenerator):
         self.seq_len = seq_len
         new_states = []
         states = self.data[0]
-        # dones = self.data[3]
-        rewards = self.data[2]
+        dones = self.data[3]
         last_done_index = -1
-        for i, reward in enumerate(rewards):
-            # reward boundery
-            done = reward != 0
+        for i, done in enumerate(dones):
             end = i + 1
             j = end - seq_len
             start = max(0, j)
