@@ -18,7 +18,7 @@ from utils import *
 
 config = {
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.cnn3d.gae.lam_1',
+    'model': 'pg.episode.ppo.cnn3d.gae.roundly',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -646,6 +646,7 @@ def discount_gae(rewards, values, gamma=0.99, lam=0.95):
     for i in reversed(range(len(rewards))):
         if rewards[i] != 0:
             gae = 0
+            next_value = 0
         delta = rewards[i] + gamma * next_value - values[i]
         gae = delta + lam * gamma * gae
         returns[i] = values[i] + gae
