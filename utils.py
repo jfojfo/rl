@@ -84,7 +84,10 @@ class MySummaryWriter(SummaryWriter):
         with open(script_path, 'r') as script_file:
             content = script_file.read()
             content = f'```python\n{content}\n```'
-            self.add_text(script_path, content, self.global_step)
+            self.summary_text(script_path, content)
+
+    def summary_text(self, key, content):
+        self.add_text(key, content, self.global_step)
 
     def summary_grad(self, optimizer, params, losses):
         if not self.check_steps():
