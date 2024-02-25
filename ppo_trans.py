@@ -552,17 +552,18 @@ class StateSeqEpDataGenerator(EpDataGenerator):
 
 
 class LookBackEpDataGenerator(EpDataGenerator):
-    def __init__(self, episodes, batch_size, lookback, data_fn):
+    def __init__(self, episodes, batch_size, lookback, data_fn, offset=0):
         super().__init__(episodes, batch_size, data_fn, False)
         self.lookback = lookback
+        self.offset = offset
+
+    def get_dynamic_offset(self):
+        return self.offset
 
     def next_batch(self):
-        for i in range(0, len(self), self.batch_size):
-            lookback_ = min(i, self.lookback)
-            batch = self.data_fn(*[d[i - lookback_:i + self.batch_size] for d in self.data])
-            batch = list(batch)
-            batch.append(lookback_)
-            yield batch
+        for i in range(self.offset, len(self), self.batch_size):
+            self.offset = min(i, self.lookback)
+            yield self.data_fn(*[d[i - self.offset:i + self.batch_size] for d in self.data])
 
 
 class LookBackSeqDataGenerator(BaseGenerator):
@@ -576,6 +577,9 @@ class LookBackSeqDataGenerator(BaseGenerator):
         super().__init__(batch_size, data_fn, False, *data)
         self.lookback = lookback
         self.offset = offset
+
+    def get_dynamic_offset(self):
+        return self.offset
 
     def next_batch(self):
         dones = self.data[3]
@@ -591,12 +595,10 @@ class LookBackSeqDataGenerator(BaseGenerator):
                 # look back window size
                 lookback_pos = max(0, start - self.lookback)
                 lookback_pos = max(lookback_pos, last_done + 1)
-                # only lookback for states
-                batch = self.data_fn(*[d[lookback_pos:end] if j == 0 else d[start:end] for j, d in enumerate(self.data)])
-                batch = list(batch)
                 # strip size
-                batch.append(start - lookback_pos)
-                yield batch
+                self.offset = start - lookback_pos
+                # only lookback for states
+                yield self.data_fn(*[d[lookback_pos:end] if j == 0 else d[start:end] for j, d in enumerate(self.data)])
 
                 if i >= total:
                     assert i == total
@@ -710,9 +712,9 @@ def loss_pg(model, data_loader, states, actions, rewards):
     return critic_loss, actor_loss, entropy_loss, loss
 
 
-def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advantages, lookback=0):
+def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advantages):
     if cfg.model_net == 'transformer':
-        dist, values = model(states.unsqueeze(0), mode='train', lookback=lookback)
+        dist, values = model(states.unsqueeze(0), mode='train', lookback=data_loader.get_dynamic_offset())
     else:
         dist, values = model(states)
     log_probs = dist.log_prob(actions)
@@ -920,7 +922,7 @@ def train_(load_from):
                 for chunk in chunk_loader.next_batch():
                     # minibatch don't exceeds cfg.max_batch_size
                     if cfg.model_net == 'transformer':
-                        minibatch_loader = LookBackSeqDataGenerator(cfg.max_batch_size, cfg.transformer.window_size, chunk[-1], data_fn, *chunk[:-1])
+                        minibatch_loader = LookBackSeqDataGenerator(cfg.max_batch_size, cfg.transformer.window_size, chunk_loader.get_dynamic_offset(), data_fn, *chunk)
                     else:
                         minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
                     optimise_by_minibatch(model, optimizer, minibatch_loader)
@@ -935,7 +937,7 @@ def train_(load_from):
                 model.clear_memory()
 
             if epoch % cfg.epoch_save == 0:
-                name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, cum_reward, epoch)
+                name = "%s_%s_%+.3f_%d.pth" % (cfg.model, cfg.env_id, avg_reward, epoch)
                 fname = os.path.join(cfg.model_dir, cfg.model, name)
                 states = {
                     'state_dict': model.state_dict(),
@@ -1067,6 +1069,7 @@ def test_LookBackSeqDataGenerator():
     v = next(iter)
     assert v[0].tolist() == [False, False, False, False, False, False, False]
     v = next(iter)
+    assert v[0].tolist() == [False, False, False, False, False]
 
 
 if __name__ == "__main__":
