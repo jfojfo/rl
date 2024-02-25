@@ -54,7 +54,7 @@ config = {
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
     'seq_len': 11,
-    'epoch_episodes': 10,
+    'epoch_episodes': 8,
     'epoch_save': 20,
     'max_epoch': 1000000,
     'target_reward': 20,
@@ -490,6 +490,11 @@ class BaseGenerator:
         for i, d in enumerate(self.data):
             self.data[i] = [d[i] for i in indices]
 
+    def normalize(self, index):
+        d = np.array(self.data[index])
+        d = normalize(d)
+        self.data[index] = list(d)
+
     def next_batch(self):
         if self.random:
             self.shuffle()
@@ -639,7 +644,7 @@ def discount_rewards_episodely(rewards, gamma=1.0):
     return discounted_rewards
 
 
-def discount_gae(rewards, values, gamma=0.99, lam=0.95):
+def discount_gae_roundly(rewards, values, gamma=0.99, lam=0.95):
     returns = np.zeros_like(rewards)
     gae = 0
     next_value = 0
@@ -705,7 +710,7 @@ def loss_pg(model, data_loader, states, actions, rewards):
     return critic_loss, actor_loss, entropy_loss, loss
 
 
-def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, lookback=0):
+def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advantages, lookback=0):
     if cfg.model_net == 'transformer':
         dist, values = model(states.unsqueeze(0), mode='train', lookback=lookback)
     else:
@@ -881,18 +886,22 @@ def train_(load_from):
             episodes = collector.roll_batch()
             total_samples = 0
             for i, episode in enumerate(episodes):
-                ep_states, ep_actions, ep_rewards, ep_dones, ep_values, *_ = episode
+                ep_states, ep_actions, ep_rewards, ep_dones, ep_log_probs, ep_values = episode
                 ep_reward_sum, ep_steps = sum(ep_rewards), len(ep_rewards)
                 avg_reward += ep_reward_sum
                 cum_reward = ep_reward_sum if cum_reward is None else cum_reward * 0.99 + ep_reward_sum * 0.01
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
                 ep_rewards = np.array(ep_rewards)
-                ep_discount_rewards = discount_gae(ep_rewards, ep_values, cfg.gamma, cfg.lam)
+                # ep_discount_rewards = discount_rewards_roundly(ep_rewards, cfg.gamma)
+                ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
                 # ep_rewards = normalize(ep_rewards)
                 # ep_rewards = list(ep_rewards)
                 # episode[2] = ep_rewards
                 episode.insert(4, list(ep_discount_rewards))
+                ep_values = np.array([v.item() for v in ep_values])
+                ep_advantages = ep_discount_rewards - ep_values
+                episode[-1] = list(ep_advantages)  # replace ep_values with ep_advantages
                 total_samples += len(ep_rewards)
             avg_reward /= len(episodes)
             writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
@@ -904,6 +913,7 @@ def train_(load_from):
                     chunk_loader = LookBackEpDataGenerator(episodes, chunk_size, cfg.transformer.window_size, lambda *d: d)
                 elif cfg.model_net in ('cnn3d', 'cnn3d2d'):
                     chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=cfg.shuffle)
+                    # chunk_loader.normalize(-1)  # advantages index: -1
                 else:
                     chunk_loader = EpDataGenerator(episodes, chunk_size, lambda *d: d, random=cfg.shuffle)
 
