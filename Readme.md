@@ -15,7 +15,8 @@
 * cnn3d2d：结合conv3d、conv2d，将特征concat到一起
 * transformer：使用transformer提取特征
 
-之前做过一些实验备忘[rl-old](https://github.com/jfojfo/rl-old)
+
+之前做过一些实验备忘[rl-old](https://github.com/jfojfo/rl-old)、 [Transformer学习](https://github.com/jfojfo/ml-learning/blob/master/Transformer%E5%AD%A6%E4%B9%A0.md)
 
 ### policy gradient(无value函数)
 
