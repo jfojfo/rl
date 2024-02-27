@@ -17,8 +17,8 @@ from utils import *
 
 
 config = {
-    'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.cnn3d.gae.roundly',
+    'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer
+    'model': 'pg.episode.ppo.transformer.discount_rewards.roundly',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -53,13 +53,13 @@ config = {
     'optimise_times': 10,  # optimise times per epoch
     'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
-    'seq_len': 11,
+    'seq_len': 129,
     'epoch_episodes': 8,
-    'epoch_save': 20,
+    'epoch_save': 50,
     'max_epoch': 1000000,
     'target_reward': 20,
     'diff_state': False,
-    'shuffle': True,
+    'shuffle': False,
 }
 cfg = Config(**config)
 cfg.transformer.window_size = cfg.seq_len - 1
@@ -722,8 +722,9 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advant
     values = values.squeeze(1)
 
     # todo: normalize?
-    advantages = rewards - values.detach()
-    advantages = normalize(advantages)
+    # advantages = rewards - values.detach()
+    # no norm for transformer, will cause NaN
+    # advantages = normalize(advantages)
     ratio = (log_probs - old_log_probs).exp()
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
@@ -907,6 +908,7 @@ def train_(load_from):
                 total_samples += len(ep_rewards)
             avg_reward /= len(episodes)
             writer.add_scalar('Reward/epoch_reward_avg', avg_reward, epoch)
+            writer.add_scalar('Reward/env_1_reward', sum(episodes[0][2]), epoch)
 
             for _ in range(cfg.optimise_times):
                 # optimise every chunk_percent samples to accelerate training
