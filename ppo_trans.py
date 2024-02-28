@@ -18,7 +18,7 @@ from utils import *
 
 config = {
     'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.transformer.discount_rewards.roundly',
+    'model': 'pg.episode.ppo.transformer.discount_rewards.roundly.fix_attn_mask',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -51,7 +51,7 @@ config = {
     },
 
     'optimise_times': 10,  # optimise times per epoch
-    'max_batch_size': 3000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
+    'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
     'seq_len': 129,
     'epoch_episodes': 8,
@@ -93,7 +93,7 @@ class MyLocalAttention(LocalAttention):
         if attn_mask is not None:
             mask = repeat(attn_mask, 'b j -> b h i j', h = sim.shape[1], i = sim.shape[2])
             mask_value = -torch.finfo(sim.dtype).max
-            sim.masked_fill(~mask, mask_value)
+            sim = sim.masked_fill(~mask, mask_value)
 
         attn = sim.softmax(dim = -1)
         attn = self.dropout(attn)
@@ -480,6 +480,7 @@ class BaseGenerator:
         self.data_fn = data_fn
         self.random = random
         self.data = list(data)
+        self.iter = 0
 
     def __len__(self):
         return len(self.data[0]) if len(self.data) > 0 else 0
@@ -495,11 +496,18 @@ class BaseGenerator:
         d = normalize(d)
         self.data[index] = list(d)
 
+    def inc_iter(self):
+        self.iter += 1
+
+    def get_iter(self):
+        return self.iter
+
     def next_batch(self):
         if self.random:
             self.shuffle()
         for i in range(0, len(self), self.batch_size):
             yield self.data_fn(*[d[i:i + self.batch_size] for d in self.data])
+            self.inc_iter()
 
 
 class EpDataGenerator(BaseGenerator):
@@ -564,6 +572,7 @@ class LookBackEpDataGenerator(EpDataGenerator):
         for i in range(self.offset, len(self), self.batch_size):
             self.offset = min(i, self.lookback)
             yield self.data_fn(*[d[i - self.offset:i + self.batch_size] for d in self.data])
+            self.inc_iter()
 
 
 class LookBackSeqDataGenerator(BaseGenerator):
@@ -599,6 +608,7 @@ class LookBackSeqDataGenerator(BaseGenerator):
                 self.offset = start - lookback_pos
                 # only lookback for states
                 yield self.data_fn(*[d[lookback_pos:end] if j == 0 else d[start:end] for j, d in enumerate(self.data)])
+                self.inc_iter()
 
                 if i >= total:
                     assert i == total
@@ -722,7 +732,7 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advant
     values = values.squeeze(1)
 
     # todo: normalize?
-    # advantages = rewards - values.detach()
+    advantages = rewards - values.detach()
     # no norm for transformer, will cause NaN
     # advantages = normalize(advantages)
     ratio = (log_probs - old_log_probs).exp()
@@ -737,18 +747,16 @@ def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advant
 
 
 def optimise_by_minibatch(model, optimizer, data_loader):
-    first_iter = True
     acc_loss, acc_critic_loss, acc_actor_loss, acc_entropy_loss = 0, 0, 0, 0
     optimizer.zero_grad()
     for states, actions, rewards, dones, discount_rewards, *extra in data_loader.next_batch():
         critic_loss, actor_loss, entropy_loss, loss = loss_ppo(model, data_loader, states, actions, discount_rewards, *extra)
 
         # summary in the first iteration and zero_grad after that
-        if first_iter:
+        if data_loader.get_iter() == 0:
             params_feature = model.get_parameter('feature.linear.weight')
             writer.summary_grad(optimizer, params_feature, {'critic': critic_loss, 'actor': actor_loss, 'entropy': entropy_loss, 'total': loss})
             optimizer.zero_grad()
-            first_iter = False
 
         loss.backward()
 
@@ -896,8 +904,8 @@ def train_(load_from):
                 print(f'Run {(epoch - 1) * cfg.epoch_episodes + i + 1}, steps {ep_steps}, reward {ep_reward_sum}, cum_reward {cum_reward:.3f}')
 
                 ep_rewards = np.array(ep_rewards)
-                # ep_discount_rewards = discount_rewards_roundly(ep_rewards, cfg.gamma)
-                ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
+                ep_discount_rewards = discount_rewards_roundly(ep_rewards, cfg.gamma)
+                # ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
                 # ep_rewards = normalize(ep_rewards)
                 # ep_rewards = list(ep_rewards)
                 # episode[2] = ep_rewards
