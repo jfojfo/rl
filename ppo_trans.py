@@ -18,7 +18,7 @@ from utils import *
 
 config = {
     'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.transformer.discount_rewards.roundly.fix_attn_mask',
+    'model': 'pg.episode.ppo.transformer.discount_rewards.roundly',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -82,23 +82,47 @@ def get_model():
 
 
 class MyLocalAttention(LocalAttention):
-    # attn_mask: (b, l)
-    def forward_simple(self, q, k, v, attn_mask = None):
+    # key_padding_mask: (b, l), prefix padding, True -> keep
+    def forward_simple(self, q, k, v, key_padding_mask=None, need_attn=False):
         q = q * (q.shape[-1] ** -0.5)
         if self.rel_pos is not None:
             pos_emb, xpos_scale = self.rel_pos(k)
             q, k = apply_rotary_pos_emb(q, k, pos_emb, scale = xpos_scale)
 
         sim = einsum('b h i e, b h j e -> b h i j', q, k)
-        if attn_mask is not None:
-            mask = repeat(attn_mask, 'b j -> b h i j', h = sim.shape[1], i = sim.shape[2])
-            mask_value = -torch.finfo(sim.dtype).max
-            sim = sim.masked_fill(~mask, mask_value)
+        sim = self.masked_fill(sim, key_padding_mask)
 
         attn = sim.softmax(dim = -1)
+        attn_weight = None
+        if need_attn:
+            attn_weight = attn.mean(dim=1)
         attn = self.dropout(attn)
         out = einsum('b h i j, b h j e -> b h i e', attn, v)
-        return out
+        return out, attn_weight
+
+    def masked_fill(self, sim, key_padding_mask=None):
+        b, h, i, j = sim.shape
+        # mask_value = -torch.finfo(sim.dtype).max
+        mask_value = float("-inf")
+        if key_padding_mask is not None:
+            mask = repeat(key_padding_mask, 'b j -> b h i j', h=h, i=i)
+            sim = sim.masked_fill(~mask, mask_value)
+            del mask
+
+        if self.causal or self.exact_windowsize:
+            t_q = torch.arange(j, i + j).reshape(-1, 1)
+            t_k = torch.arange(i, i + j)
+            mask = torch.zeros(i, j, dtype=torch.bool)
+            if self.causal:
+                # 对齐右下角最后一个元素
+                mask = mask | (t_q < t_k)
+            if self.exact_windowsize:
+                # mask element outside of sliding window
+                mask = mask | (t_q > (t_k + self.window_size))
+            mask = repeat(mask, 'i j -> b h i j', b=b, h=h)
+            sim = sim.masked_fill(mask.to(sim.device), mask_value)
+            del mask
+        return sim
 
 
 class TransformerBlock(nn.Module):
@@ -118,6 +142,7 @@ class TransformerBlock(nn.Module):
             autopad = True,
             exact_windowsize = True,
         )
+        # self.attn_fn = nn.MultiheadAttention(inner_dim, cfg.num_heads, batch_first=True)
 
         if cfg.layer_norm == "pre":
             self.norm1 = nn.LayerNorm(dim)
@@ -142,9 +167,10 @@ class TransformerBlock(nn.Module):
         k, v = mem_kv.chunk(2, dim = -1)
 
         if mode == 'inference':
-            h = self.attn_fn.forward_simple(q, k, v, attn_mask=mask)
+            h, attn_weight = self.attn_fn.forward_simple(q, k, v, key_padding_mask=mask, need_attn=True)
         else:
-            h = self.attn_fn(q, k, v)
+            # h, attn_weight = self.attn_fn(q, k, v)
+            h, attn_weight = self.attn_fn.forward_simple(q, k, v, need_attn=True)
         h = rearrange(h, 'b h n d -> b n (h d)')
         h = h + x
 
@@ -162,7 +188,7 @@ class TransformerBlock(nn.Module):
         if self.cfg.layer_norm == 'post':
             out = self.norm2(out)
 
-        return out, mem_kv
+        return out, attn_weight, mem_kv
 
 
 class TransformerModel(nn.Module):
@@ -198,14 +224,16 @@ class TransformerModel(nn.Module):
     def forward(self, x, mask = None, mode = 'inference', lookback = 0):
         h = self.feature(x)
 
+        attn_weights = []
         for i, block in enumerate(self.transformer_blocks):
             if mode == 'inference':
                 mem_kv = self.memory[i].get()
                 mask_size = 1 if self.memory[i].is_empty() else (mem_kv.shape[-2] + 1)
-                h, mem_kv = block(h, mem_kv, mask[:, -mask_size:], mode)
+                h, attn_weight, mem_kv = block(h, mem_kv, mask[:, -mask_size:], mode)
                 self.memory[i].set(mem_kv)
             else:
-                h, _ = block(h, Memory.get_empty_mem(), mode=mode)
+                h, attn_weight, _ = block(h, Memory.get_empty_mem(), mode=mode)
+            attn_weights.append(attn_weight)
 
         if mode == 'inference':
             h = h.squeeze(1)
@@ -215,7 +243,7 @@ class TransformerModel(nn.Module):
         logits = self.actor(h)
         dist = Categorical(logits=logits)
         value = self.critic(h)
-        return dist, value
+        return dist, value, attn_weights
 
 
 class Memory:
@@ -724,7 +752,9 @@ def loss_pg(model, data_loader, states, actions, rewards):
 
 def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advantages):
     if cfg.model_net == 'transformer':
-        dist, values = model(states.unsqueeze(0), mode='train', lookback=data_loader.get_dynamic_offset())
+        dist, values, attn_weights = model(states.unsqueeze(0), mode='train', lookback=data_loader.get_dynamic_offset())
+        if data_loader.get_iter() == 0:
+            writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weights])
     else:
         dist, values = model(states)
     log_probs = dist.log_prob(actions)
@@ -869,7 +899,7 @@ def train_(load_from):
             state_ = collector.peek_state(cfg.seq_len, state_)
         if cfg.model_net == 'transformer':
             mask = collector.peek_mask(cfg.seq_len)
-            dist, value = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
+            dist, value, _ = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
                                 torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
         else:
             state_ = torch.FloatTensor(state_).to(cfg.device)
@@ -1080,6 +1110,46 @@ def test_LookBackSeqDataGenerator():
     assert v[0].tolist() == [False, False, False, False, False, False, False]
     v = next(iter)
     assert v[0].tolist() == [False, False, False, False, False]
+
+
+def test_MyLocalAttention():
+    attn = MyLocalAttention(
+            dim = cfg.transformer.dim_head,
+            window_size = cfg.transformer.window_size,
+            causal = True,
+            autopad = True,
+            exact_windowsize = True,
+        )
+    b, h, i, j = 2, 3, 1, 5
+    sim = torch.ones(b, h, i, j, dtype=torch.float32)
+    key_padding_mask = torch.ones(b, j, dtype=torch.bool)
+    sim_masked = attn.masked_fill(sim, key_padding_mask)
+    assert (sim_masked == sim).all()
+
+    key_padding_mask = torch.tensor([[False, False, False, False, True],
+                                     [False, False, False, False, True]], dtype=torch.bool)
+    sim_masked = attn.masked_fill(sim, key_padding_mask)
+    sim_target = sim.clone()
+    sim_target[:, :, :, 0:4] = float("-inf")
+    assert (sim_masked == sim_target).all()
+
+    key_padding_mask = torch.tensor([[False, False, True, True, True],
+                                     [False, True, True, True, True]], dtype=torch.bool)
+    sim_masked = attn.masked_fill(sim, key_padding_mask)
+    sim_target = sim.clone()
+    sim_target[0, :, :, 0:2] = float("-inf")
+    sim_target[1, :, :, 0:1] = float("-inf")
+    assert (sim_masked == sim_target).all()
+
+    b, h, i, j = 2, 3, 5, 5
+    sim = torch.ones(b, h, i, j, dtype=torch.float32)
+    sim_masked = attn.masked_fill(sim)
+    sim_target = sim.clone()
+    sim_target[:, :, 0, 1:] = float("-inf")
+    sim_target[:, :, 1, 2:] = float("-inf")
+    sim_target[:, :, 2, 3:] = float("-inf")
+    sim_target[:, :, 3, 4:] = float("-inf")
+    assert (sim_masked == sim_target).all()
 
 
 if __name__ == "__main__":
