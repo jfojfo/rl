@@ -23,7 +23,7 @@ config = {
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pg.episode.ppo.cnn3d.gae',
+    # 'wandb': 'pg.episode.ppo.transformer.discount_rewards.roundly',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,

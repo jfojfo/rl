@@ -73,6 +73,7 @@ class MySummaryWriter(SummaryWriter):
         self.global_step = step
         self.steps_to_log = steps_to_log
         self.summary = {}
+        self.summary_images = {}
 
     def update_global_step(self, global_step):
         self.global_step = global_step
@@ -104,10 +105,19 @@ class MySummaryWriter(SummaryWriter):
         for name, loss in losses.items():
             summary[f'Loss/{name}'] = loss.item()
 
+    def summary_attns(self, attns):
+        if not self.check_steps():
+            return
+        for i, attn in enumerate(attns):
+            self.summary_images[f'Attention/{i}'] = attn
+
     def write_summary(self):
         for k, v in self.summary.items():
             self.add_scalar(k, v, self.global_step)
+        for k, img in self.summary_images.items():
+            self.add_image(k, img, self.global_step)
         self.summary = {}
+        self.summary_images = {}
 
 
 def wandb_login():
