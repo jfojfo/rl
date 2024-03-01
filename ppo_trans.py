@@ -48,6 +48,7 @@ config = {
         # 'window_size': 256,  # seq_len - 1
         'layer_norm': 'pre',  # pre/post
         'positional_encoding': 'rotary',  # relative/learned/rotary
+        'dropout': 0.0,
     },
 
     'optimise_times': 10,  # optimise times per epoch
@@ -129,11 +130,10 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        inner_dim = cfg.dim_head * cfg.num_heads
-        dim = inner_dim
+        dim = cfg.dim_head * cfg.num_heads
 
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+        self.to_q = nn.Linear(dim, dim, bias = False)
+        self.to_kv = nn.Linear(dim, dim * 2, bias = False)
 
         self.attn_fn = MyLocalAttention(
             dim = cfg.dim_head,
@@ -141,6 +141,7 @@ class TransformerBlock(nn.Module):
             causal = True,
             autopad = True,
             exact_windowsize = True,
+            dropout = cfg.dropout,
         )
         # self.attn_fn = nn.MultiheadAttention(inner_dim, cfg.num_heads, batch_first=True)
 
@@ -152,7 +153,13 @@ class TransformerBlock(nn.Module):
             self.norm1 = nn.LayerNorm(dim)
             self.norm2 = nn.LayerNorm(dim)
 
-        self.to_out = nn.Linear(inner_dim, dim)
+        self.to_out = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.ReLU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(dim * 4, dim)
+        )
+
 
     def forward(self, x, mem_kv, mask = None, mode = 'inference'):
         x_ = x
@@ -203,6 +210,8 @@ class TransformerModel(nn.Module):
             ('flatten', nn.Flatten(start_dim=2)),
             ('linear', nn.Linear(in_features=cfg.state_dim, out_features=cfg.dim_input)),
         ]))
+        # prevent "dying ReLU" output zero
+        nn.init.orthogonal_(self.feature.linear.weight, np.sqrt(2))
 
         assert cfg.num_blocks > 0
         self.transformer_blocks = nn.ModuleList([
@@ -230,7 +239,7 @@ class TransformerModel(nn.Module):
                 mem_kv = self.memory[i].get()
                 mask_size = 1 if self.memory[i].is_empty() else (mem_kv.shape[-2] + 1)
                 h, attn_weight, mem_kv = block(h, mem_kv, mask[:, -mask_size:], mode)
-                self.memory[i].set(mem_kv)
+                self.memory[i].set(mem_kv.detach())
             else:
                 h, attn_weight, _ = block(h, Memory.get_empty_mem(), mode=mode)
             attn_weights.append(attn_weight)
@@ -858,6 +867,14 @@ def diff_state(state, last_state):
     return state if not cfg.diff_state else (state - last_state)
 
 
+def make_env(env_id, seed=0, **kwargs):
+    def _init():
+        env = gym.make(env_id, **kwargs)
+        env.seed(seed)  # Apply a unique seed to each environment
+        return env
+    return _init
+
+
 def train_(load_from):
     global writer
     writer = MySummaryWriter(0, cfg.epoch_save // 4, comment=f'.{cfg.model}.{cfg.env_id}')
@@ -866,7 +883,7 @@ def train_(load_from):
     else:
         writer.summary_text('', f'```python\n{In[-1]}\n```')
 
-    envs = [lambda: gym.make(cfg.env_id, render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs  # Prepare N actors in N environments
+    envs = [make_env(cfg.env_id, seed=np.random.randint(0, 10000), render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs  # Prepare N actors in N environments
     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
     num_outputs = 2  #envs.action_space.n
 
@@ -922,6 +939,8 @@ def train_(load_from):
             epoch += 1
             writer.update_global_step(epoch)
             avg_reward = 0
+            if cfg.model_net == 'transformer':
+                model.clear_memory()
 
             # [(states, actions, rewards, ...), ...]
             episodes = collector.roll_batch()
