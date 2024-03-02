@@ -132,6 +132,8 @@ ppo算法，采样后重复10次优化，每次使用1/64的minibatch梯度更�
 ### ppo_trans.py：
 在ppo.py基础上，添加Transformer模型，并进行了优化，大大提升训练速度。（前面所有能力及代码重构，最终全部集成在ppo_trans.py）
 
+注意，用transformer时，loss_ppo中不能对advantage做normalize，会很快出现 NaN； states embedding参数最好做一下 orthogonal_ sqrt(2) 初始化； 另外8个envs都做一下random seed
+
 #### inference优化
 收集episode数据期间，需要与环境交互，每走一步需要一次inference给出action，而每次inference都涉及到整个sequence的计算。
 
