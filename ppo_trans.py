@@ -17,8 +17,8 @@ from utils import *
 
 
 config = {
-    'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer
-    'model': 'pg.episode.ppo.transformer.discount_rewards.roundly',
+    'model_net': 'transformercnn',  # mlp, cnn, cnn3d, transformer, transformercnn
+    'model': 'pg.episode.ppo.transformercnn.discount_rewards.roundly',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
     'game_visible': False,
@@ -78,6 +78,8 @@ def get_model():
         return CNN3d2dModel
     elif cfg.model_net == 'transformer':
         return TransformerModel
+    elif cfg.model_net == 'transformercnn':
+        return TransformerCNNModel
     else:
         return MLPModel
 
@@ -232,6 +234,52 @@ class TransformerModel(nn.Module):
     # mode: inference/train
     def forward(self, x, mask = None, mode = 'inference', lookback = 0):
         h = self.feature(x)
+
+        attn_weights = []
+        for i, block in enumerate(self.transformer_blocks):
+            if mode == 'inference':
+                mem_kv = self.memory[i].get()
+                mask_size = 1 if self.memory[i].is_empty() else (mem_kv.shape[-2] + 1)
+                h, attn_weight, mem_kv = block(h, mem_kv, mask[:, -mask_size:], mode)
+                self.memory[i].set(mem_kv.detach())
+            else:
+                h, attn_weight, _ = block(h, Memory.get_empty_mem(), mode=mode)
+            attn_weights.append(attn_weight)
+
+        if mode == 'inference':
+            h = h.squeeze(1)
+        else:
+            h = h.squeeze(0)
+            h = h[lookback:, ...]
+        logits = self.actor(h)
+        dist = Categorical(logits=logits)
+        value = self.critic(h)
+        return dist, value, attn_weights
+
+
+class TransformerCNNModel(TransformerModel):
+    def __init__(self, cfg, num_outputs):
+        super().__init__(cfg, num_outputs)
+        cfg = self.cfg
+
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4, padding=2)),
+            ('act1', nn.ReLU()),
+            ('conv2', nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2, padding=1)),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.dim_input)),
+        ]))
+        # prevent "dying ReLU" output zero
+        nn.init.orthogonal_(self.feature.linear.weight, np.sqrt(2))
+
+    # mode: inference/train
+    def forward(self, x, mask = None, mode = 'inference', lookback = 0):
+        x = x.permute(0, 1, 4, 2, 3)
+        b, l, *_ = x.shape
+        x = x.reshape(-1, *x.shape[2:])
+        h = self.feature(x)
+        h = h.reshape(b, l, *h.shape[1:])
 
         attn_weights = []
         for i, block in enumerate(self.transformer_blocks):
@@ -760,7 +808,7 @@ def loss_pg(model, data_loader, states, actions, rewards):
 
 
 def loss_ppo(model, data_loader, states, actions, rewards, old_log_probs, advantages):
-    if cfg.model_net == 'transformer':
+    if cfg.model_net in ('transformer', 'transformercnn'):
         dist, values, attn_weights = model(states.unsqueeze(0), mode='train', lookback=data_loader.get_dynamic_offset())
         if data_loader.get_iter() == 0:
             writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weights])
@@ -914,7 +962,7 @@ def train_(load_from):
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_state(cfg.seq_len, state_)
-        if cfg.model_net == 'transformer':
+        if cfg.model_net in ('transformer', 'transformercnn'):
             mask = collector.peek_mask(cfg.seq_len)
             dist, value, _ = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
                                 torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
@@ -939,7 +987,7 @@ def train_(load_from):
             epoch += 1
             writer.update_global_step(epoch)
             avg_reward = 0
-            if cfg.model_net == 'transformer':
+            if cfg.model_net in ('transformer', 'transformercnn'):
                 model.clear_memory()
 
             # [(states, actions, rewards, ...), ...]
@@ -970,7 +1018,7 @@ def train_(load_from):
             for _ in range(cfg.optimise_times):
                 # optimise every chunk_percent samples to accelerate training
                 chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
-                if cfg.model_net == 'transformer':
+                if cfg.model_net in ('transformer', 'transformercnn'):
                     chunk_loader = LookBackEpDataGenerator(episodes, chunk_size, cfg.transformer.window_size, lambda *d: d)
                 elif cfg.model_net in ('cnn3d', 'cnn3d2d'):
                     chunk_loader = StateSeqEpDataGenerator(episodes, chunk_size, cfg.seq_len, lambda *d: d, random=cfg.shuffle)
@@ -980,7 +1028,7 @@ def train_(load_from):
 
                 for chunk in chunk_loader.next_batch():
                     # minibatch don't exceeds cfg.max_batch_size
-                    if cfg.model_net == 'transformer':
+                    if cfg.model_net in ('transformer', 'transformercnn'):
                         minibatch_loader = LookBackSeqDataGenerator(cfg.max_batch_size, cfg.transformer.window_size, chunk_loader.get_dynamic_offset(), data_fn, *chunk)
                     else:
                         minibatch_loader = BaseGenerator(cfg.max_batch_size, data_fn, False, *chunk)
@@ -992,7 +1040,7 @@ def train_(load_from):
             state = batch_prepro(state)
             last_state = state.copy()
             collector.clear_all()
-            if cfg.model_net == 'transformer':
+            if cfg.model_net in ('transformer', 'transformercnn'):
                 model.clear_memory()
 
             if epoch % cfg.epoch_save == 0:
@@ -1022,7 +1070,7 @@ def test_env(env, model):
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_state(cfg.seq_len, state_[np.newaxis, ...])
-        if cfg.model_net == 'transformer':
+        if cfg.model_net in ('transformer', 'transformercnn'):
             mask = collector.peek_mask(cfg.seq_len)
             dist, value = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
                                 torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
