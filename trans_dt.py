@@ -29,7 +29,7 @@ config = {
     'wandb': None,
     'run_in_notebook': False,
 
-    'n_envs': 8,  # simultaneous processing environments
+    'n_envs': 2,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_critic': 1.0,  # critic coefficient
@@ -54,9 +54,9 @@ config = {
 
     'optimise_times': 1,  # optimise times per epoch
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
-    'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
+    'chunk_percent': 1/16,  # split into chunks, do optimise per chunk
     'seq_len': 129,
-    'epoch_episodes': 1,
+    'epoch_episodes': 2,
     'epoch_save': 50,
     'max_epoch': 1000000,
     'target_reward': 20,
@@ -238,7 +238,6 @@ class TransformerModel(TransformerBaseModel):
         )
 
     def forward(self, x, query_mask=None, key_mask=None, mode='inference', lookback=0):
-        x = x.permute(0, 1, 4, 2, 3)
         h = self.feature(x)
         h, attn_weights = super().forward(h, query_mask, key_mask, mode)
         if mode == 'inference':
@@ -276,7 +275,7 @@ class TransformerCNNModel(TransformerModel):
         nn.init.orthogonal_(self.feature.linear.weight, np.sqrt(2))
 
 
-class DTModel(TransformerBaseModel):
+class DTModel(TransformerCNNModel):
     def __init__(self, cfg, num_outputs):
         super().__init__(cfg, num_outputs)
         # self.cfg = cfg.transformer
@@ -315,7 +314,7 @@ class DTModel(TransformerBaseModel):
         if key_mask is not None:
             stacked_key_mask = repeat(key_mask, 'b j -> b (j m)', m=3)
 
-        h, attn_weights = super().forward(stacked_inputs, stacked_query_mask, stacked_key_mask, mode)
+        h, attn_weights = TransformerBaseModel.forward(self, stacked_inputs, stacked_query_mask, stacked_key_mask, mode)
 
         if mode == 'inference':
             next_actions = self.predict_action(h[:, 1::3].squeeze(1))
@@ -404,7 +403,6 @@ class CNNModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 3, 1, 2)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
@@ -432,7 +430,6 @@ class CNN3dModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 4, 1, 2, 3)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
@@ -467,7 +464,6 @@ class CNN3d2dModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 4, 1, 2, 3)
         feature3d = self.feature3d(x)
         feature2d = self.feature2d(x[:, :, -1, ...])
         feature = torch.cat([feature3d, feature2d], dim=-1)
@@ -1039,7 +1035,7 @@ class Train:
         early_stop = False
 
         while not early_stop and epoch < cfg.max_epoch:
-            state_ = self.diff_state(state, last_state)
+            state_ = self.diff_state(state, last_state).transpose(0, 3, 1, 2)
 
             with torch.no_grad():
                 params = self.get_model_params(collector, state_)
@@ -1200,7 +1196,7 @@ def test_env(env, model):
     total_reward = 0
     steps = 0
     while not done:
-        state_ = diff_state(state, last_state)
+        state_ = diff_state(state, last_state).transpose(2, 0, 1)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_state(cfg.seq_len, state_[np.newaxis, ...])
         if cfg.model_net in ('transformer', 'transformercnn'):
@@ -1216,7 +1212,7 @@ def test_env(env, model):
         next_state, reward, done, _, _ = env.step(action + 2)
         next_state = prepro(next_state)
 
-        collector.add([diff_state(state, last_state)], [action], [reward], [done])
+        collector.add([diff_state(state, last_state).transpose(2, 0, 1)], [action], [reward], [done])
         last_state = state
         state = next_state
         total_reward += reward
