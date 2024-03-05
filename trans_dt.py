@@ -18,7 +18,7 @@ from utils import *
 
 
 config = {
-    'model_net': 'dt',  # mlp, cnn, cnn3d, transformer, dt
+    'model_net': 'dt',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
     'model': 'pg.episode.ppo.dt.roundly',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
@@ -52,11 +52,11 @@ config = {
         'dropout': 0.0,
     },
 
-    'optimise_times': 10,  # optimise times per epoch
+    'optimise_times': 1,  # optimise times per epoch
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
     'seq_len': 129,
-    'epoch_episodes': 8,
+    'epoch_episodes': 1,
     'epoch_save': 50,
     'max_epoch': 1000000,
     'target_reward': 20,
@@ -238,6 +238,7 @@ class TransformerModel(TransformerBaseModel):
         )
 
     def forward(self, x, query_mask=None, key_mask=None, mode='inference', lookback=0):
+        x = x.permute(0, 1, 4, 2, 3)
         h = self.feature(x)
         h, attn_weights = super().forward(h, query_mask, key_mask, mode)
         if mode == 'inference':
@@ -249,6 +250,30 @@ class TransformerModel(TransformerBaseModel):
         dist = Categorical(logits=logits)
         value = self.critic(h)
         return dist, value, attn_weights
+
+
+class SeqConv2d(nn.Conv2d):
+    def forward(self, x):
+        n, l, c, h, w = x.shape
+        x = x.view(-1, c, h, w)
+        x = super().forward(x)
+        x = x.view(n, l, *x.shape[1:])
+        return x
+
+        
+class TransformerCNNModel(TransformerModel):
+    def __init__(self, cfg, num_outputs):
+        super().__init__(cfg, num_outputs)
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', SeqConv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4, padding=2)),
+            ('act1', nn.ReLU()),
+            ('conv2', SeqConv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2, padding=1)),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten(start_dim=2)),
+            ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.dim_input)),
+        ]))
+        # prevent "dying ReLU" output zero
+        nn.init.orthogonal_(self.feature.linear.weight, np.sqrt(2))
 
 
 class DTModel(TransformerBaseModel):
@@ -819,8 +844,10 @@ def loss_pg(model, data_loader, states, actions, rewards):
 
 
 def loss_ppo(trainer, data_loader, states, actions, rewards, old_log_probs, advantages):
-    if cfg.model_net == 'transformer':
-        dist, values, attn_weights = trainer.model(states.unsqueeze(0), mode='train', lookback=data_loader.get_dynamic_offset())
+    if cfg.model_net in ('transformer', 'transformercnn'):
+        lookback = data_loader.get_dynamic_offset()
+        dist, values, attn_weights = trainer.model(states.unsqueeze(0), mode='train', lookback=lookback)
+        states, actions, rewards, old_log_probs, advantages = states[lookback:], actions[lookback:], rewards[lookback:], old_log_probs[lookback:], advantages[lookback:]
         if data_loader.get_iter() == 0:
             trainer.writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weights])
     else:
@@ -875,6 +902,8 @@ class Train:
             return CNN3d2dModel(cfg, num_outputs)
         elif cfg.model_net == 'transformer':
             return TransformerModel(cfg.transformer, num_outputs)
+        elif cfg.model_net == 'transformercnn':
+            return TransformerCNNModel(cfg.transformer, num_outputs)
         elif cfg.model_net == 'dt':
             return DTModel(cfg.transformer, num_outputs)
 
@@ -1151,7 +1180,7 @@ class TrainDT(TrainTransformer):
         if data_loader.get_iter() == 0:
             self.writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weights])
 
-        action_loss = F.cross_entropy(next_action_logits, actions[data_loader.get_dynamic_offset():], reduction='sum') / len(data_loader)
+        action_loss = F.cross_entropy(next_action_logits, actions[lookback:], reduction='sum') / len(data_loader)
 
         dist = Categorical(logits=next_action_logits)
         entropy = dist.entropy()
@@ -1174,7 +1203,7 @@ def test_env(env, model):
         state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_state(cfg.seq_len, state_[np.newaxis, ...])
-        if cfg.model_net == 'transformer':
+        if cfg.model_net in ('transformer', 'transformercnn'):
             mask = collector.peek_mask(cfg.seq_len)
             dist, value = model(torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device),
                                 torch.as_tensor(mask, dtype=torch.bool).to(cfg.device))
@@ -1198,9 +1227,9 @@ def test_env(env, model):
 
 def train(load_from=None):
     wandb_init(cfg.wandb, cfg)
-    if cfg.model_net in ['cnn3d', 'cnn3d2d']:
+    if cfg.model_net in ('cnn3d', 'cnn3d2d'):
         TrainCNN3d().train(load_from)
-    elif cfg.model_net == 'transformer':
+    elif cfg.model_net in ('transformer', 'transformercnn'):
         TrainTransformer().train(load_from)
     elif cfg.model_net == 'dt':
         TrainDT().train(load_from)
