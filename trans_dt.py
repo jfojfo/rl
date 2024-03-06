@@ -18,10 +18,13 @@ from utils import *
 
 
 config = {
-    'model_net': 'dt',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'pg.episode.ppo.dt.roundly',
+    'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
+    'model': 'pg.episode.ppo.cnn3d.multi_games',
     'model_dir': 'models',
     'env_id': 'PongDeterministic-v0',
+    # 'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
+    'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4',
+                    'Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     # 'wandb': 'pg.episode.ppo.dt.roundly',
@@ -29,7 +32,7 @@ config = {
     'wandb': None,
     'run_in_notebook': False,
 
-    'n_envs': 2,  # simultaneous processing environments
+    'n_envs': 8,  # simultaneous processing environments
     'lr': 1e-4,
     'hidden_dim': 200,  # hidden size, linear units of the output layer
     'c_critic': 1.0,  # critic coefficient
@@ -52,16 +55,16 @@ config = {
         'dropout': 0.0,
     },
 
-    'optimise_times': 1,  # optimise times per epoch
+    'optimise_times': 10,  # optimise times per epoch
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
-    'chunk_percent': 1/16,  # split into chunks, do optimise per chunk
-    'seq_len': 129,
-    'epoch_episodes': 2,
+    'chunk_percent': 1/64,  # split into chunks, do optimise per chunk
+    'seq_len': 11,
+    'epoch_episodes': 8,
     'epoch_save': 50,
     'max_epoch': 1000000,
-    'target_reward': 20,
+    'target_reward': 20000000,
     'diff_state': False,
-    'shuffle': False,
+    'shuffle': True,
 }
 cfg = Config(**config)
 cfg.transformer.window_size = cfg.seq_len - 1
@@ -557,6 +560,9 @@ class BatchEpisodeCollector:
 
     def has_full_batch(self, episodes_count):
         assert episodes_count > 0
+        for ec in self.episode_collectors:
+            if ec.episodes_count() <= 0:
+                return False
         return sum([ec.episodes_count() for ec in self.episode_collectors]) >= episodes_count
 
     def roll_batch(self):
@@ -876,7 +882,7 @@ def loss_ppo(trainer, data_loader, states, actions, rewards, old_log_probs, adva
     # todo: normalize?
     advantages = rewards - values.detach()
     # no norm for transformer, will cause NaN
-    # advantages = normalize(advantages)
+    advantages = normalize(advantages)
     ratio = (log_probs - old_log_probs).exp()
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
@@ -899,11 +905,18 @@ class Train:
 
     @staticmethod
     def make_envs():
-        def _init(env_id, seed=None, **kwargs):
-            env = gym.make(env_id, **kwargs)
-            env.seed(seed)  # Apply a unique seed to each environment
-            return env
-        envs = [lambda: _init(cfg.env_id, seed=np.random.randint(0, 10000), render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs
+        def make_env(env_id, seed=None, **kwargs):
+            def _init():
+                env = gym.make(env_id, **kwargs)
+                n_actions = env.action_space.n
+                if env_id.startswith('MsPacman'):
+                    n_actions = 5
+                env = ActionModifierWrapper(n_actions, env)
+                env.seed(seed)  # Apply a unique seed to each environment
+                return env
+            return _init
+        # envs = [lambda: _init(cfg.env_id, seed=np.random.randint(0, 10000), render_mode='human' if cfg.game_visible else 'rgb_array')] * cfg.n_envs
+        envs = [make_env(env_id, seed=np.random.randint(0, 10000), render_mode='human' if cfg.game_visible else 'rgb_array') for env_id in cfg.env_id_list]
         envs = SubprocVecEnv(envs)
         return envs
 
@@ -1000,6 +1013,7 @@ class Train:
         ep_states, ep_actions, ep_rewards, ep_dones, ep_log_probs, ep_values = episode
         ep_rewards = np.array(ep_rewards)
         ep_discount_rewards = discount_rewards_roundly(ep_rewards, cfg.gamma)
+        ep_discount_rewards /= (np.abs(ep_discount_rewards).max() + 1e-8)
         # ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
         # ep_rewards = normalize(ep_rewards)
         # ep_rewards = list(ep_rewards)
@@ -1039,7 +1053,7 @@ class Train:
             writer.summary_text('', f'```python\n{In[-1]}\n```')
 
         envs = self.make_envs()
-        num_outputs = 2  #envs.action_space.n
+        num_outputs = 6  #envs.action_space.n
 
         model = self.model = self.get_model(cfg, num_outputs).to(cfg.device)
         optimizer = optim.Adam(model.parameters(), lr=cfg.lr)  # implements Adam algorithm
@@ -1050,21 +1064,21 @@ class Train:
 
         collector = self.collector = BatchEpisodeCollector(cfg.n_envs)
         state = envs.reset()
-        state = batch_prepro(state)
+        state = grey_crop_resize_batch(state)
         last_state = state.copy()
 
         early_stop = False
 
         while not early_stop and epoch < cfg.max_epoch:
-            state_ = self.diff_state(state, last_state).transpose(0, 3, 1, 2)
+            state_ = self.diff_state(state, last_state)
 
             with torch.no_grad():
                 params = self.get_model_params(collector, state_)
                 action, *extra = self.predict_action(*model(*params))
 
             action = action.cpu().numpy()
-            next_state, reward, done, _ = envs.step(action + 2)
-            next_state = batch_prepro(next_state)
+            next_state, reward, done, _ = envs.step(action)
+            next_state = grey_crop_resize_batch(next_state)
 
             collector.add(state_, action, reward, done, *extra)
             last_state = state
@@ -1094,7 +1108,7 @@ class Train:
                 writer.write_summary()
 
                 state = envs.reset()
-                state = batch_prepro(state)
+                state = grey_crop_resize_batch(state)
                 last_state = state.copy()
                 self.end_epoch_optimize(epoch)
 
@@ -1209,7 +1223,7 @@ class TrainDT(TrainTransformer):
 
 def test_env(env, model):
     state, _ = env.reset()
-    state = prepro(state)
+    state = grey_crop_resize(state)
     last_state = state.copy()
 
     collector = BatchEpisodeCollector(1)
@@ -1217,7 +1231,7 @@ def test_env(env, model):
     total_reward = 0
     steps = 0
     while not done:
-        state_ = diff_state(state, last_state).transpose(2, 0, 1)
+        state_ = diff_state(state, last_state)
         if cfg.model_net in ('cnn3d', 'cnn3d2d'):
             state_ = collector.peek_state(cfg.seq_len, state_[np.newaxis, ...])
         if cfg.model_net in ('transformer', 'transformercnn'):
@@ -1231,9 +1245,9 @@ def test_env(env, model):
         action = dist.sample()
         action = action.cpu().numpy()[0]
         next_state, reward, done, _, _ = env.step(action + 2)
-        next_state = prepro(next_state)
+        next_state = grey_crop_resize(next_state)
 
-        collector.add([diff_state(state, last_state).transpose(2, 0, 1)], [action], [reward], [done])
+        collector.add([diff_state(state, last_state)], [action], [reward], [done])
         last_state = state
         state = next_state
         total_reward += reward
@@ -1259,7 +1273,7 @@ def eval(load_from=None):
 
     env_test = gym.make(cfg.env_id, render_mode='human')
     # num_outputs = env_test.action_space.n
-    num_outputs = 2
+    num_outputs = 6
     model = get_model()(cfg, num_outputs).to(cfg.device)
     model.eval()
 

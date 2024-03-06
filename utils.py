@@ -3,6 +3,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from PIL import Image
+import gymnasium as gym
 
 
 normal_repr = torch.Tensor.__repr__
@@ -30,7 +31,7 @@ def prepro(I):
   I[I == 144] = 0 # erase background (background type 1)
   I[I == 109] = 0 # erase background (background type 2)
   I[I != 0] = 1 # everything else (paddles, ball) just set to 1
-  return I.astype(np.float32)
+  return I.astype(np.float32).transpose(2, 0, 1)
 
 
 def batch_prepro(I):
@@ -40,7 +41,7 @@ def batch_prepro(I):
   I[I == 144] = 0 # erase background (background type 1)
   I[I == 109] = 0 # erase background (background type 2)
   I[I != 0] = 1 # everything else (paddles, ball) just set to 1
-  return I.astype(np.float32)
+  return I.astype(np.float32).transpose(0, 3, 1, 2)
 
 
 def grey_crop_resize_batch(state):  # deal with batch observations
@@ -53,18 +54,39 @@ def grey_crop_resize_batch(state):  # deal with batch observations
     return states_array # B*C*H*W
 
 
+# def grey_crop_resize(state): # deal with single observation
+#     img = Image.fromarray(state)
+#     grey_img = img.convert(mode='L')
+#     left = 0
+#     top = 34  # empirically chosen
+#     right = 160
+#     bottom = 194  # empirically chosen
+#     cropped_img = grey_img.crop((left, top, right, bottom))
+#     resized_img = cropped_img.resize((84, 84))
+#     array_2d = np.asarray(resized_img)
+#     array_3d = np.expand_dims(array_2d, axis=0)
+#     return array_3d / 255. # C*H*W
+
+
 def grey_crop_resize(state): # deal with single observation
     img = Image.fromarray(state)
     grey_img = img.convert(mode='L')
-    left = 0
-    top = 34  # empirically chosen
-    right = 160
-    bottom = 194  # empirically chosen
-    cropped_img = grey_img.crop((left, top, right, bottom))
-    resized_img = cropped_img.resize((84, 84))
+    resized_img = grey_img.resize((80, 80))
     array_2d = np.asarray(resized_img)
     array_3d = np.expand_dims(array_2d, axis=0)
     return array_3d / 255. # C*H*W
+
+
+class ActionModifierWrapper(gym.Wrapper):
+    def __init__(self, n_actions, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_actions = n_actions
+
+    def step(self, action):
+        # Modify the action before passing it to the environment
+        if action >= self.n_actions:
+            action = 0  # NOOP
+        return self.env.step(action)
 
 
 class MySummaryWriter(SummaryWriter):
