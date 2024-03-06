@@ -430,11 +430,22 @@ class CNN3dModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
+        x = x.permute(0, 2, 1, 3, 4)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
         value = self.critic(feature)
         return dist, value
+
+
+class ConcatenateModule(nn.Module):
+    def __init__(self, dim=-1):
+        super(ConcatenateModule, self).__init__()
+        self.dim = dim
+
+    def forward(self, tensors):
+        # Concatenate the two input tensors along the specified dimension
+        return torch.cat(tensors, dim=self.dim)
 
 
 class CNN3d2dModel(nn.Module):
@@ -457,19 +468,29 @@ class CNN3d2dModel(nn.Module):
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.hidden_dim)),
         ]))
+        self.feature = nn.Sequential(OrderedDict([
+            ('concat', ConcatenateModule(dim=-1)),
+            ('linear', nn.Linear(in_features=cfg.hidden_dim * 2, out_features=cfg.hidden_dim)),
+        ]))
         self.actor = nn.Sequential(
             # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
             # nn.ReLU(),
-            nn.Linear(in_features=cfg.hidden_dim * 2, out_features=num_outputs),
+            nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=1),
         )
 
     def forward(self, x: torch.Tensor):
+        x = x.permute(0, 2, 1, 3, 4)
         feature3d = self.feature3d(x)
         feature2d = self.feature2d(x[:, :, -1, ...])
-        feature = torch.cat([feature3d, feature2d], dim=-1)
+        # feature = torch.cat([feature3d, feature2d], dim=-1)
+        feature = self.feature([feature3d, feature2d])
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
-        return dist,  # return iterable tuple
+        value = self.critic(feature)
+        return dist, value
 
 
 class EpisodeCollector:
