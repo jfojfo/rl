@@ -905,7 +905,7 @@ def loss_ppo(trainer, data_loader, states, actions, rewards, old_log_probs, adva
 class Train:
     def __init__(self):
         self.writer = MySummaryWriter(0, cfg.epoch_save // 4, comment=f'.{cfg.model}')
-        self.cum_reward = {}
+        self.cum_reward = {i: None for i in range(len(cfg.env_id_list))}
 
     @staticmethod
     def diff_state(state, last_state):
@@ -1020,13 +1020,10 @@ class Train:
     def process_episodes(self, episodes):
         total_samples = 0
         avg_reward = {}
+        avg_reward = {i: [] for i in range(len(cfg.env_id_list))}
         cum_reward = self.cum_reward
         epoch = self.writer.global_step
         for (i, j), episode in episodes.items():
-            if i not in avg_reward:
-                avg_reward[i] = []
-            if i not in cum_reward:
-                cum_reward[i] = None
             ep_states, ep_actions, ep_rewards, ep_dones, *_ = episode
             ep_reward_sum, ep_steps = sum(ep_rewards), len(ep_rewards)
             avg_reward[i].append(ep_reward_sum)
@@ -1046,7 +1043,7 @@ class Train:
     def recalc_episode(self, episode):
         ep_states, ep_actions, ep_rewards, ep_dones, ep_log_probs, ep_values = episode
         ep_rewards = np.array(ep_rewards)
-        ep_discount_rewards = discount_rewards_roundly(ep_rewards, cfg.gamma)
+        ep_discount_rewards = discount_rewards_episodely(ep_rewards, cfg.gamma)
         ep_discount_rewards /= (np.abs(ep_discount_rewards).max() + 1e-8)
         # ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
         # ep_rewards = normalize(ep_rewards)
