@@ -12,11 +12,11 @@ from collector import *
 
 
 config = {
-    'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'pg.episode.ppo.cnn.seq',
+    'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
+    'model': 'pg.episode.ppo.cnn3d.seq',
     'model_dir': 'models',
     # 'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
-    'env_id_list': ['Pong-v4'] * 8,
+    'env_id_list': ['PongDeterministic-v0'] * 8,
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     # 'wandb': 'pg.episode.ppo.dt.roundly',
@@ -417,7 +417,7 @@ class Train:
             print(f"steps {steps}, reward {reward}")
 
 
-class TrainSeq(Train):
+class SeqTrain(Train):
     def process_episodes(self, seq_data):
         with torch.no_grad():
             params = self.get_model_params(self.collector, self.collector.next_state)
@@ -428,8 +428,8 @@ class TrainSeq(Train):
         sq_discount_rewards = list(normalize(np.array(sq_discount_rewards)))
 
         seq_data.insert(self.collector.DoneIndex + 1, sq_discount_rewards)
-        ep_advantages = [discount_reward - value for discount_reward, value in zip(sq_discount_rewards, sq_values)]
-        seq_data[-1] = ep_advantages  # replace sq_values with sq_advantages
+        sq_advantages = [discount_reward - value for discount_reward, value in zip(sq_discount_rewards, sq_values)]
+        seq_data[-1] = sq_advantages  # replace sq_values with sq_advantages
 
         self.update_1_env(seq_data)
         total_samples = len(sq_states) * len(sq_states[0])
@@ -454,7 +454,7 @@ class TrainSeq(Train):
                 self.steps_1_env = 0
 
     def get_data_collector(self):
-        return MultiSeqStepCollector(cfg.epoch_size)
+        return MultiStepCollector(cfg.epoch_size)
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
         episodes = [*zip(*seq_data)]
@@ -486,7 +486,7 @@ def get_trainer():
     #     return TrainDT()
     # else:
     #     return Train()
-    return TrainSeq()
+    return SeqTrain()
 
 
 def train(load_from=None):
@@ -511,133 +511,3 @@ if __name__ == "__main__":
         train(args.model)
     else:
         eval(args.model)
-
-
-
-
-
-# def ppo_train(model, envs, device, optimizer, test_rewards, test_epochs, train_epoch, best_reward, early_stop=False):
-#     writer = SummaryWriter(comment=f'.{MODEL}.{ENV_ID}')
-#     env_test = gym.make(ENV_ID, render_mode='rgb_array')
-
-#     state = envs.reset()
-#     state = grey_crop_resize_batch(state)
-
-#     total_reward_1_env = 0
-#     total_runs_1_env = 0
-#     steps_1_env = 0
-
-#     while not early_stop:
-#         log_probs = []
-#         values = []
-#         states = []
-#         actions = []
-#         rewards = []
-#         masks = []
-
-#         for i in range(T):
-#             state = torch.FloatTensor(state).to(device)
-#             dist, value = model(state)
-#             action = dist.sample().to(device)
-#             next_state, reward, done, _ = envs.step(action.cpu().numpy())
-#             next_state = grey_crop_resize_batch(next_state)  # simplify perceptions (grayscale-> crop-> resize) to train CNN
-#             log_prob = dist.log_prob(action)  # needed to compute probability ratio r(theta) that prevent policy to vary too much probability related to each action (make the computations more robust)
-#             log_prob_vect = log_prob.reshape(len(log_prob), 1)  # transpose from row to column
-#             log_probs.append(log_prob_vect)
-#             action_vect = action.reshape(len(action), 1)  # transpose from row to column
-#             actions.append(action_vect)
-#             values.append(value)
-#             rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(device))
-#             masks.append(torch.FloatTensor(1 - done).unsqueeze(1).to(device))
-#             states.append(state)
-#             state = next_state
-
-#             total_reward_1_env += reward[0]
-#             steps_1_env += 1
-#             if done[0]:
-#                 total_runs_1_env += 1
-#                 print(f'Run {total_runs_1_env}, steps {steps_1_env}, Reward {total_reward_1_env}')
-#                 writer.add_scalar('Reward/train_reward_1_env', total_reward_1_env, train_epoch * T + i + 1)
-#                 total_reward_1_env = 0
-#                 steps_1_env = 0
-
-#         next_state = torch.FloatTensor(next_state).to(device)  # consider last state of the collection step
-#         _, next_value = model(next_state)  # collect last value effect of the last collection step
-#         returns = compute_gae(next_value, rewards, masks, values)
-#         returns = torch.cat(returns).detach()  # concatenates along existing dimension and detach the tensor from the network graph, making the tensor no gradient
-#         log_probs = torch.cat(log_probs).detach()
-#         values = torch.cat(values).detach()
-#         states = torch.cat(states)
-#         actions = torch.cat(actions)
-#         advantage = returns - values  # compute advantage for each action
-#         advantage = normalize(advantage)  # compute the normalization of the vector to make uniform values
-#         loss, actor_loss, critic_loss, entropy_loss = ppo_update(
-#             model, optimizer, states, actions, log_probs, returns, advantage)
-#         train_epoch += 1
-
-#         total_steps = train_epoch * T
-#         writer.add_scalar('Loss/Total Loss', loss.item(), total_steps)
-#         writer.add_scalar('Loss/Actor Loss', actor_loss.item(), total_steps)
-#         writer.add_scalar('Loss/Critic Loss', critic_loss.item(), total_steps)
-#         writer.add_scalar('Loss/Entropy Loss', entropy_loss.item(), total_steps)
-
-#         if train_epoch % T_EPOCHS == 0:  # do a test every T_EPOCHS times
-#             test_reward = np.mean([test_env(env_test, model, device) for _ in range(N_TESTS)])  # do N_TESTS tests and takes the mean reward
-#             test_rewards.append(test_reward)  # collect the mean rewards for saving performance metric
-#             test_epochs.append(train_epoch)
-#             print('Epoch: %s -> Reward: %s' % (train_epoch, test_reward))
-#             writer.add_scalar('Reward/test_reward', test_reward, total_steps)
-
-#             if best_reward is None or best_reward < test_reward:  # save a checkpoint every time it achieves a better reward
-#                 if best_reward is not None:
-#                     print("Best reward updated: %.3f -> %.3f" % (best_reward, test_reward))
-#                     name = "%s_%s_%+.3f_%d.pth" % (MODEL, ENV_ID, test_reward, train_epoch)
-#                     fname = os.path.join(MODEL_DIR, name)
-#                     states = {
-#                         'state_dict': model.state_dict(),
-#                         'optimizer': optimizer.state_dict(),
-#                         'test_rewards': test_rewards,
-#                         'test_epochs': test_epochs,
-#                     }
-#                     torch.save(states, fname)
-
-#                 best_reward = test_reward
-
-#             if test_reward > TARGET_REWARD:  # stop training if archive the best
-#                 early_stop = True
-
-
-# def train(load_from=None):
-#     print('Env:', ENV_ID)
-#     print('Model:', MODEL)
-#     use_cuda = torch.cuda.is_available()  # Autodetect CUDA
-#     device = torch.device("cuda" if use_cuda else "cpu")
-#     print('Device:', device)
-
-#     envs = [lambda: gym.make(ENV_ID, render_mode='rgb_array')] * N  # Prepare N actors in N environments
-#     envs = SubprocVecEnv(envs)  # Vectorized Environments are a method for stacking multiple independent environments into a single environment. Instead of the training an RL agent on 1 environment per step, it allows us to train it on n environments per step. Because of this, actions passed to the environment are now a vector (of dimension n). It is the same for observations, rewards and end of episode signals (dones). In the case of non-array observation spaces such as Dict or Tuple, where different sub-spaces may have different shapes, the sub-observations are vectors (of dimension n).
-#     num_inputs = 1
-#     num_outputs = envs.action_space.n
-#     model = CNN(num_inputs, num_outputs, H_SIZE).to(device)
-#     optimizer = optim.Adam(model.parameters(), lr=L_RATE)  # implements Adam algorithm
-#     test_rewards = []
-#     test_epochs = []
-#     train_epoch = 0
-#     best_reward = None
-
-#     if load_from is not None:
-#         checkpoint = torch.load(load_from, map_location=None if use_cuda else torch.device('cpu'))
-#         model.load_state_dict(checkpoint['state_dict'])
-#         optimizer.load_state_dict(checkpoint['optimizer'])
-#         test_rewards = checkpoint['test_rewards']
-#         test_epochs = checkpoint['test_epochs']
-#         train_epoch = test_epochs[-1]
-#         best_reward = test_rewards[-1]
-#         print(f'Model loaded, starting from epoch %d' % (train_epoch + 1))
-#         print('Previous best reward: %.3f' % (best_reward))
-
-#     print(model)
-#     print(optimizer)
-
-#     ppo_train(model, envs, device, optimizer, test_rewards, test_epochs, train_epoch, best_reward)
-

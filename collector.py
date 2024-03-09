@@ -10,16 +10,16 @@ class Collector:
     DoneIndex = 3
 
 
-class SeqStepCollector:
-    def __init__(self, seq_len, lookback=0):
-        self.seq_len = seq_len
+class StepCollector:
+    def __init__(self, buf_len, lookback=0):
+        self.buf_len = buf_len
         self.lookback = lookback
         self.seq = []
         self.count = 0
 
     def add(self, item):
         self.seq.append(item)
-        pos = self.seq_len + self.lookback
+        pos = self.buf_len + self.lookback
         self.seq = self.seq[-pos:]
         self.count += 1
 
@@ -37,42 +37,42 @@ class SeqStepCollector:
         return self.seq[-pos:]
 
 
-class MultiSeqStepCollector(Collector):
-    def __init__(self, seq_len, lookback=0, lookforward=0):
-        self.seq_len = seq_len
+class MultiStepCollector(Collector):
+    def __init__(self, buf_len, lookback=0, lookforward=0):
+        self.buf_len = buf_len
         self.lookback = lookback
         self.lookforward = lookforward
-        self.seq_list = None
+        self.step_collectors = None
 
     # state, action, reward, done, next_state, *extra_pt_tensor
     def add(self, state, action, reward, done, next_state, *extra):
         # prevent torch.as_tensor throwing warning for np.bool_ array
         items = (state, action, reward, done.astype(np.int32)) + extra
         self.next_state = next_state
-        if self.seq_list is None:
-            self.seq_list = [SeqStepCollector(self.seq_len + self.lookback) for _ in range(len(items))]
+        if self.step_collectors is None:
+            self.step_collectors = [StepCollector(self.buf_len + self.lookback) for _ in range(len(items))]
         for i, item in enumerate(items):
-            self.seq_list[i].add(item)
+            self.step_collectors[i].add(item)
 
     def has_full_batch(self, n_steps):
-        if self.seq_list is None or len(self.seq_list) == 0:
+        if self.step_collectors is None or len(self.step_collectors) == 0:
             return False
-        curr_steps = self.seq_list[0].steps_count()
+        curr_steps = self.step_collectors[0].steps_count()
         assert curr_steps <= n_steps
         return curr_steps == n_steps
 
     def roll_batch(self):
-        return [seq.roll() for seq in self.seq_list]
+        return [seq.roll() for seq in self.step_collectors]
 
     def roll_batch_with_index(self):
-        return {i: seq.roll() for i, seq in enumerate(self.seq_list)}
+        return {i: seq.roll() for i, seq in enumerate(self.step_collectors)}
 
     def clear_all(self):
         pass
 
     def peek_batch(self, index, seq_len, padding=0):
-        assert index < len(self.seq_list)
-        seq_data = self.seq_list[index].peek()
+        assert index < len(self.step_collectors)
+        seq_data = self.step_collectors[index].peek()
         d = seq_len - len(seq_data)
         if d > 0:
             seq_data = [padding] * d + seq_data
