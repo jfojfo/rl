@@ -24,6 +24,10 @@ class Config(SimpleNamespace):
             return value
 
 
+def normalize(data):
+    return (data - data.mean()) / (data.std() + 1e-8)
+
+
 def prepro(I):
   """ prepro 210x160x3 uint8 frame into 6400 (80x80) 1D float vector """
   I = I[35:195] # crop
@@ -54,27 +58,27 @@ def grey_crop_resize_batch(state):  # deal with batch observations
     return states_array # B*C*H*W
 
 
-# def grey_crop_resize(state): # deal with single observation
-#     img = Image.fromarray(state)
-#     grey_img = img.convert(mode='L')
-#     left = 0
-#     top = 34  # empirically chosen
-#     right = 160
-#     bottom = 194  # empirically chosen
-#     cropped_img = grey_img.crop((left, top, right, bottom))
-#     resized_img = cropped_img.resize((84, 84))
-#     array_2d = np.asarray(resized_img)
-#     array_3d = np.expand_dims(array_2d, axis=0)
-#     return array_3d / 255. # C*H*W
-
-
 def grey_crop_resize(state): # deal with single observation
     img = Image.fromarray(state)
     grey_img = img.convert(mode='L')
-    resized_img = grey_img.resize((80, 80))
+    left = 0
+    top = 34  # empirically chosen
+    right = 160
+    bottom = 194  # empirically chosen
+    cropped_img = grey_img.crop((left, top, right, bottom))
+    resized_img = cropped_img.resize((84, 84))
     array_2d = np.asarray(resized_img)
     array_3d = np.expand_dims(array_2d, axis=0)
     return array_3d / 255. # C*H*W
+
+
+# def grey_crop_resize(state): # deal with single observation
+#     img = Image.fromarray(state)
+#     grey_img = img.convert(mode='L')
+#     resized_img = grey_img.resize((80, 80))
+#     array_2d = np.asarray(resized_img)
+#     array_3d = np.expand_dims(array_2d, axis=0)
+#     return array_3d / 255. # C*H*W
 
 
 class ActionModifierWrapper(gym.Wrapper):
