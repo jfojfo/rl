@@ -275,7 +275,6 @@ class TransformerCNNModel(TransformerModel):
 
     # mode: inference/train
     def forward(self, x, mask = None, mode = 'inference', lookback = 0):
-        x = x.permute(0, 1, 4, 2, 3)
         b, l, *_ = x.shape
         x = x.reshape(-1, *x.shape[2:])
         h = self.feature(x)
@@ -377,7 +376,6 @@ class CNNModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 3, 1, 2)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
@@ -405,7 +403,6 @@ class CNN3dModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 4, 1, 2, 3)
         feature = self.feature(x)
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
@@ -440,7 +437,6 @@ class CNN3d2dModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 4, 1, 2, 3)
         feature3d = self.feature3d(x)
         feature2d = self.feature2d(x[:, :, -1, ...])
         feature = torch.cat([feature3d, feature2d], dim=-1)
@@ -1002,7 +998,7 @@ def train_(load_from):
 
                 ep_rewards = np.array(ep_rewards)
                 ep_discount_rewards = discount_rewards_roundly(ep_rewards, cfg.gamma)
-                # ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
+                ep_discount_rewards = discount_gae_roundly(ep_rewards, ep_values, cfg.gamma, cfg.lam)
                 # ep_rewards = normalize(ep_rewards)
                 # ep_rewards = list(ep_rewards)
                 # episode[2] = ep_rewards
