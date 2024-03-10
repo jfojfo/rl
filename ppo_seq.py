@@ -13,13 +13,13 @@ from collector import *
 
 config = {
     'model_net': 'cnn3d',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'pg.episode.ppo.cnn3d.seq',
+    'model': 'ppo.seq.cnn3d',
     'model_dir': 'models',
     # 'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
     'env_id_list': ['PongDeterministic-v0'] * 8,
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'pg.episode.ppo.dt.roundly',
+    # 'wandb': 'ppo.seq.cnn3d',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
@@ -302,7 +302,7 @@ class Train:
             writer.summary_text('', f'```python\n{In[-1]}\n```')
 
         envs = self.make_envs()
-        num_outputs = cfg.n_actions  #envs.action_space.n
+        num_outputs = cfg.n_actions = cfg.transformer.action_dim = envs.action_space.n
 
         model = self.model = self.get_model(cfg, num_outputs).to(cfg.device)
         optimizer = optim.Adam(model.parameters(), lr=cfg.lr)  # implements Adam algorithm
