@@ -306,6 +306,7 @@ class MLPModel(nn.Module):
         self.feature = nn.Sequential(OrderedDict([
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=80 * 80, out_features=cfg.hidden_dim)),
+            ('act', nn.ReLU()),
         ]))
         self.actor = nn.Sequential(
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
@@ -333,10 +334,9 @@ class CNNModel(nn.Module):
             ('act2', nn.ReLU()),
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.hidden_dim)),
+            ('act3', nn.ReLU()),
         ]))
         self.actor = nn.Sequential(
-            # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
-            # nn.ReLU(),
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
         )
         self.critic = nn.Sequential(
@@ -362,6 +362,7 @@ class CNN3dModel(nn.Module):
             ('act2', nn.ReLU()),
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=32 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
+            ('act3', nn.ReLU()),
         ]))
         self.actor = nn.Sequential(
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
@@ -400,6 +401,7 @@ class CNN3d2dModel(nn.Module):
             ('act2', nn.ReLU()),
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=32 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
+            ('act3', nn.ReLU()),
         ]))
         self.feature2d = nn.Sequential(OrderedDict([
             ('conv1', nn.Conv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4, padding=2)),
@@ -408,14 +410,14 @@ class CNN3d2dModel(nn.Module):
             ('act2', nn.ReLU()),
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=32 * 10 * 10, out_features=cfg.hidden_dim)),
+            ('act3', nn.ReLU()),
         ]))
         self.feature = nn.Sequential(OrderedDict([
             ('concat', ConcatenateModule(dim=-1)),
             ('linear', nn.Linear(in_features=cfg.hidden_dim * 2, out_features=cfg.hidden_dim)),
+            ('act', nn.ReLU()),
         ]))
         self.actor = nn.Sequential(
-            # nn.Linear(in_features=cfg.hidden_dim, out_features=cfg.hidden_dim),
-            # nn.ReLU(),
             nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
         )
         self.critic = nn.Sequential(

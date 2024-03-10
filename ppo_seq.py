@@ -25,7 +25,7 @@ config = {
     'run_in_notebook': False,
 
     'lr': 1e-4,
-    'hidden_dim': 200,  # hidden size, linear units of the output layer
+    'hidden_dim': 256,  # hidden size, linear units of the output layer
     'c_critic': 1.0,  # critic coefficient
     'c_entropy': 0.01,  # entropy coefficient
     'gamma': 0.99,
@@ -457,8 +457,7 @@ class SeqTrain(Train):
         return MultiStepCollector(cfg.epoch_size)
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
-        episodes = [*zip(*seq_data)]
-        return EpDataGenerator(episodes, chunk_size, data_fn, random=random)
+        return SqDataGenerator(seq_data, chunk_size, data_fn, random)
 
     def get_minibatch_loader(self, chunk_loader, max_batch_size, data_fn, random, *chunk):
         return BaseGenerator(max_batch_size, data_fn, random, *chunk)
@@ -477,16 +476,27 @@ class SeqTrain(Train):
         return avg_reward / episodes
 
 
+class SeqTrainCNN3d(SeqTrain):
+    def get_model_params(self, collector, state):
+        state_ = collector.peek_state(cfg.seq_len, state)
+        # return tuple
+        return torch.FloatTensor(state_).to(cfg.device),
+
+    def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
+        lookback = cfg.seq_len - 1
+        offset = len(seq_data[0]) - cfg.epoch_size
+        return StateSqDataGenerator(seq_data, chunk_size, lookback, offset, data_fn, random)
+
+
 def get_trainer():
-    # if cfg.model_net in ('cnn3d', 'cnn3d2d'):
-    #     return TrainCNN3d()
+    if cfg.model_net in ('cnn3d', 'cnn3d2d'):
+        return SeqTrainCNN3d()
     # elif cfg.model_net in ('transformer', 'transformercnn'):
     #     return TrainTransformer()
     # elif cfg.model_net == 'dt':
     #     return TrainDT()
-    # else:
-    #     return Train()
-    return SeqTrain()
+    else:
+        return SeqTrain()
 
 
 def train(load_from=None):

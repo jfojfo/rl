@@ -1,6 +1,6 @@
 import random
 import numpy as np
-from utils import normalize
+from utils import normalize, lookback_mask
 
 
 class Collector:
@@ -71,8 +71,10 @@ class MultiStepCollector(Collector):
         pass
 
     def peek_batch(self, index, seq_len, padding=0):
+        if self.step_collectors is None:
+            return [padding] * seq_len
         assert index < len(self.step_collectors)
-        seq_data = self.step_collectors[index].peek()
+        seq_data = self.step_collectors[index].peek(seq_len)
         d = seq_len - len(seq_data)
         if d > 0:
             seq_data = [padding] * d + seq_data
@@ -83,7 +85,7 @@ class MultiStepCollector(Collector):
         seq = self.peek_batch(index, seq_len - 1, padding)
         seq.append(elem)
         assert len(seq) == seq_len
-        return seq
+        return np.array(seq).swapaxes(1, 0)
 
     def peek_state(self, seq_len, state):
         return self.peek_and_append(self.StateIndex, seq_len, state, state - state)
@@ -312,7 +314,7 @@ class StateSeqEpDataGenerator(EpDataGenerator):
             # update after mask to prevent mask all
             if done:
                 last_done_index = i
-            new_states.append(x)
+            new_states.append(seq_state)
             assert len(seq_state) == seq_len
         self.data[0] = new_states
 
@@ -384,7 +386,40 @@ class LookBackSeqDataGenerator(BaseGenerator):
             i += 1
 
 
+# sequence data generator
+class SqDataGenerator(EpDataGenerator):
+    def __init__(self, seq_data, batch_size, data_fn, random=False):
+        episodes = [*zip(*seq_data)]
+        super().__init__(episodes, batch_size, data_fn, random)
 
+
+class StateSqDataGenerator(SqDataGenerator):
+    def __init__(self, seq_data, batch_size, lookback, offset, data_fn, random=False):
+        self.lookback = lookback
+        states_seq = seq_data[Collector.StateIndex]
+        dones_seq = seq_data[Collector.DoneIndex]
+
+        new_states_seq = []
+        for i in range(offset, len(states_seq)):
+            end = i + 1
+            start = max(0, i - lookback)
+            sq_states = np.array(states_seq[start:end])
+            sq_dones = np.array(dones_seq[start:end])
+            sq_masks = lookback_mask(sq_dones)  # first dim is sequence
+            sq_masks = sq_masks.reshape(sq_masks.shape + (1,) * (sq_states.ndim - sq_masks.ndim))
+            sq_states = sq_states * sq_masks  # auto broadcast
+
+            # history steps not enough at env starting
+            start = i - lookback
+            if start < 0:
+                padding = [np.zeros_like(sq_states[0:1])] * (-start)
+                sq_states = np.concatenate([*padding, sq_states], axis=0)
+
+            new_states_seq.append(sq_states.swapaxes(0, 1))
+
+        # new list, do not modify seq_data
+        data = [new_states_seq, *seq_data[1:]]
+        super().__init__(data, batch_size, data_fn, random)
 
 
 def test_StateSeqEpDataGenerator():
@@ -453,6 +488,7 @@ def test_LookBackSeqDataGenerator():
 
 
 def test_MyLocalAttention():
+    from model import MyLocalAttention
     attn = MyLocalAttention(
             dim = cfg.transformer.dim_head,
             window_size = cfg.transformer.window_size,
@@ -463,19 +499,19 @@ def test_MyLocalAttention():
     b, h, i, j = 2, 3, 1, 5
     sim = torch.ones(b, h, i, j, dtype=torch.float32)
     key_padding_mask = torch.ones(b, j, dtype=torch.bool)
-    sim_masked = attn.masked_fill(sim, key_padding_mask)
+    sim_masked = attn.masked_fill(sim, key_mask=key_padding_mask)
     assert (sim_masked == sim).all()
 
     key_padding_mask = torch.tensor([[False, False, False, False, True],
                                      [False, False, False, False, True]], dtype=torch.bool)
-    sim_masked = attn.masked_fill(sim, key_padding_mask)
+    sim_masked = attn.masked_fill(sim, key_mask=key_padding_mask)
     sim_target = sim.clone()
     sim_target[:, :, :, 0:4] = float("-inf")
     assert (sim_masked == sim_target).all()
 
     key_padding_mask = torch.tensor([[False, False, True, True, True],
                                      [False, True, True, True, True]], dtype=torch.bool)
-    sim_masked = attn.masked_fill(sim, key_padding_mask)
+    sim_masked = attn.masked_fill(sim, key_mask=key_padding_mask)
     sim_target = sim.clone()
     sim_target[0, :, :, 0:2] = float("-inf")
     sim_target[1, :, :, 0:1] = float("-inf")
@@ -490,3 +526,47 @@ def test_MyLocalAttention():
     sim_target[:, :, 2, 3:] = float("-inf")
     sim_target[:, :, 3, 4:] = float("-inf")
     assert (sim_masked == sim_target).all()
+
+
+def test_StateSqDataGenerator():
+    seq_data = [
+        list(np.arange(20).reshape(2,10).T + 1),
+        list(np.arange(20).reshape(2,10).T + 1),
+        list(np.arange(20).reshape(2,10).T + 1),
+        list(np.array([0, 0, 1, 0, 0, 1, 0, 0, 0, 1] * 2).reshape(2,10).T),
+    ]
+    g = StateSqDataGenerator(seq_data, 3, 2, 0, data_fn)
+    assert np.all(np.array(g.data[0]) == np.array([[0, 0, 1], [0, 0, 11],
+                                    [0, 1, 2], [0, 11, 12],
+                                    [1, 2, 3], [11, 12, 13],
+                                    [0, 0, 4], [0, 0, 14],
+                                    [0, 4, 5], [0, 14, 15],
+                                    [4, 5, 6], [14, 15, 16],
+                                    [0, 0, 7], [0, 0, 17],
+                                    [0, 7, 8], [0, 17, 18],
+                                    [7, 8, 9], [17, 18, 19],
+                                    [8, 9, 10], [18, 19, 20]]))
+    g = StateSqDataGenerator(seq_data, 3, 2, 5, data_fn)
+    assert np.all(np.array(g.data[0]) == np.array([
+                                    [4, 5, 6], [14, 15, 16],
+                                    [0, 0, 7], [0, 0, 17],
+                                    [0, 7, 8], [0, 17, 18],
+                                    [7, 8, 9], [17, 18, 19],
+                                    [8, 9, 10], [18, 19, 20]]))
+
+
+if __name__ == '__main__':
+    import torch
+    from ppo_seq import cfg
+
+    def data_fn(self, states, actions, rewards, *extra):
+        states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
+        actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
+        rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
+        extra = [torch.as_tensor(e).to(cfg.device) for e in extra]
+        return states, actions, rewards, *extra
+
+    test_StateSeqEpDataGenerator()
+    test_LookBackSeqDataGenerator()
+    test_MyLocalAttention()
+    test_StateSqDataGenerator()

@@ -146,6 +146,16 @@ class MySummaryWriter(SummaryWriter):
         self.summary_images = {}
 
 
+# along axis 0
+def lookback_mask(dones):
+    mask = 1 - dones
+    mask[-1] = 1  # ... 0 -> ... 1
+    mask = mask[::-1]
+    mask = np.minimum.accumulate(mask, axis=0)
+    mask = mask[::-1]
+    return mask.copy()  # return copy to prevent reverse index error when converting torch tensor
+
+
 def wandb_login():
     import wandb
     from kaggle_secrets import UserSecretsClient
