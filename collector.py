@@ -555,7 +555,7 @@ def test_StateSqDataGenerator():
                                     [0, 7, 8], [0, 17, 18],
                                     [7, 8, 9], [17, 18, 19],
                                     [8, 9, 10], [18, 19, 20]]))
-    assert np.all(np.array(g.data[3]) == np.arange(20).reshape(2,10).T + 1)
+    assert np.all(np.array(g.data[2]) == np.stack([np.arange(1,11), np.arange(11, 21)], 1).reshape(-1))
     g = StateSqDataGenerator(seq_data, 3, 2, 5, data_fn)
     assert np.all(np.array(g.data[0]) == np.array([
                                     [4, 5, 6], [14, 15, 16],
@@ -563,6 +563,7 @@ def test_StateSqDataGenerator():
                                     [0, 7, 8], [0, 17, 18],
                                     [7, 8, 9], [17, 18, 19],
                                     [8, 9, 10], [18, 19, 20]]))
+    assert np.all(np.array(g.data[2]) == np.stack([np.arange(6,11), np.arange(16, 21)], 1).reshape(-1))
 
 
 if __name__ == '__main__':
