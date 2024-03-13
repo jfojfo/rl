@@ -48,25 +48,31 @@ def batch_prepro(I):
   return I.astype(np.float32).transpose(0, 3, 1, 2)
 
 
-def grey_crop_resize_batch(state):  # deal with batch observations
+def grey_crop_resize_batch(state, env_id_list=None):  # deal with batch observations
     states = []
-    for i in state:
-        array_3d = grey_crop_resize(i)
+    for i, ob in enumerate(state):
+        array_3d = grey_crop_resize(ob, env_id_list[i] if env_id_list is not None else None)
         array_4d = np.expand_dims(array_3d, axis=0)
         states.append(array_4d)
     states_array = np.vstack(states) # turn the stack into array
     return states_array # B*C*H*W
 
 
-def grey_crop_resize(state): # deal with single observation
+crop_rect = {
+    'Pong': (0, 160, 34, 194),
+    'Breakout': (0, 160, 32, 196),
+}
+def grey_crop_resize(state, env_id=None): # deal with single observation
     img = Image.fromarray(state)
     grey_img = img.convert(mode='L')
-    left = 0
-    top = 34  # empirically chosen
-    right = 160
-    bottom = 194  # empirically chosen
+    left, right, top, bottom = 0, img.width, 0, img.height
+    if env_id is not None:
+        for k, v in crop_rect.items():
+            if env_id.startswith(k):
+                left, right, top, bottom = v
+                break
     cropped_img = grey_img.crop((left, top, right, bottom))
-    resized_img = cropped_img.resize((84, 84))
+    resized_img = cropped_img.resize((80, 80))
     array_2d = np.asarray(resized_img)
     array_3d = np.expand_dims(array_2d, axis=0)
     return array_3d / 255. # C*H*W

@@ -50,6 +50,7 @@ config = {
     'optimise_times': 10,  # optimise times per epoch
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/32,  # split into chunks, do optimise per chunk
+    'chunk_size': None,
     'seq_len': 11,
     'epoch_size': 256,
     'epoch_episodes': 8,
@@ -313,7 +314,7 @@ class Train:
 
         collector = self.collector = self.get_data_collector()
         state = envs.reset()
-        state = grey_crop_resize_batch(state)
+        state = grey_crop_resize_batch(state, cfg.env_id_list)
         last_state = state.copy()
 
         early_stop = False
@@ -327,7 +328,7 @@ class Train:
 
             # action = action.cpu().numpy()
             next_state, reward, done, _ = envs.step(action)
-            next_state = grey_crop_resize_batch(next_state)
+            next_state = grey_crop_resize_batch(next_state, cfg.env_id_list)
 
             # reset state to next_state when done
             for i, d in enumerate(done):
@@ -348,7 +349,7 @@ class Train:
 
                 for _ in range(cfg.optimise_times):
                     # optimise every chunk_percent samples to accelerate training
-                    chunk_size = int(np.ceil(total_samples * cfg.chunk_percent))
+                    chunk_size = cfg.chunk_size if cfg.chunk_size is not None else int(np.ceil(total_samples * cfg.chunk_percent))
                     chunk_loader = self.get_chunk_loader(episodes, chunk_size, lambda *d: d, cfg.shuffle)
 
                     for chunk in chunk_loader.next_batch():
@@ -361,7 +362,7 @@ class Train:
                 # need reset for training episodely
                 reset_state = self.end_epoch_optimize(epoch, envs)
                 if reset_state is not None:
-                    state = grey_crop_resize_batch(reset_state)
+                    state = grey_crop_resize_batch(reset_state, cfg.env_id_list)
                     last_state = state.copy()
 
                 if epoch % cfg.epoch_save == 0:
@@ -375,7 +376,7 @@ class Train:
 
     def test_env(self, env, model):
         state, _ = env.reset()
-        state = grey_crop_resize(state)
+        state = grey_crop_resize(state, env.spec.id)
         last_state = state.copy()
 
         collector = BatchEpisodeCollector(1)
@@ -390,7 +391,7 @@ class Train:
             action, *extra = self.predict_action(*model(*params))
 
             next_state, reward, done, _, _ = env.step(action[0])
-            next_state = grey_crop_resize(next_state)
+            next_state = grey_crop_resize(next_state, env.spec.id)
             next_state_ = next_state[np.newaxis, ...]
 
             collector.add(state_, action, [reward], [done], next_state_)
@@ -406,7 +407,7 @@ class Train:
 
         env_test = gym.make(cfg.env_id_list[0], render_mode='human')
         # num_outputs = env_test.action_space.n
-        num_outputs = cfg.n_actions
+        num_outputs = cfg.n_actions = cfg.transformer.action_dim = env_test.action_space.n
         model = self.get_model(cfg, num_outputs).to(cfg.device)
         model.eval()
 
@@ -425,10 +426,10 @@ class SeqTrain(Train):
 
         sq_states, sq_actions, sq_rewards, sq_dones, sq_log_probs, sq_values = seq_data
         sq_discount_rewards = discount_gae(sq_rewards, sq_dones, sq_values, next_value, cfg.gamma, cfg.lam)
-        sq_discount_rewards = list(normalize(np.array(sq_discount_rewards)))
 
         seq_data.insert(self.collector.DoneIndex + 1, sq_discount_rewards)
         sq_advantages = [discount_reward - value for discount_reward, value in zip(sq_discount_rewards, sq_values)]
+        sq_advantages = list(normalize(np.array(sq_advantages)))
         seq_data[-1] = sq_advantages  # replace sq_values with sq_advantages
 
         self.update_1_env(seq_data)
@@ -477,6 +478,9 @@ class SeqTrain(Train):
 
 
 class SeqTrainCNN3d(SeqTrain):
+    def get_data_collector(self):
+        return MultiStepCollector(cfg.epoch_size, lookback=cfg.seq_len - 1)
+
     def get_model_params(self, collector, state):
         state_ = collector.peek_state(cfg.seq_len, state)
         # return tuple
