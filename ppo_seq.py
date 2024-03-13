@@ -437,6 +437,9 @@ class SeqTrain(Train):
         return total_samples
 
     def update_1_env(self, seq_data):
+        offset = len(seq_data[0]) - cfg.epoch_size
+        seq_data = [d[offset:] for d in seq_data]
+
         if not hasattr(self, 'total_runs_1_env'):
             self.total_runs_1_env = 0
             self.steps_1_env = 0

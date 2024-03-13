@@ -11,30 +11,28 @@ class Collector:
 
 
 class StepCollector:
-    def __init__(self, buf_len, lookback=0):
+    def __init__(self, buf_len):
+        assert buf_len > 0
         self.buf_len = buf_len
-        self.lookback = lookback
         self.seq = []
         self.count = 0
 
     def add(self, item):
         self.seq.append(item)
-        pos = self.buf_len + self.lookback
-        self.seq = self.seq[-pos:]
+        self.seq = self.seq[-self.buf_len:]
         self.count += 1
 
     def steps_count(self):
         return self.count
 
-    def roll(self):
+    def roll(self, lookback=0):
         ret = self.seq
-        self.seq = ret[-self.lookback:]
+        self.seq = ret[-lookback:] if lookback > 0 else []
         self.count = 0
         return ret
 
     def peek(self, n):
-        pos = n + self.lookback
-        return self.seq[-pos:]
+        return self.seq[-n:] if n > 0 else []
 
 
 class MultiStepCollector(Collector):
@@ -62,7 +60,7 @@ class MultiStepCollector(Collector):
         return curr_steps == n_steps
 
     def roll_batch(self):
-        return [seq.roll() for seq in self.step_collectors]
+        return [seq.roll(self.lookback) for seq in self.step_collectors]
 
     def roll_batch_with_index(self):
         return {i: seq.roll() for i, seq in enumerate(self.step_collectors)}
@@ -416,9 +414,10 @@ class StateSqDataGenerator(SqDataGenerator):
                 sq_states = np.concatenate([*padding, sq_states], axis=0)
 
             new_states_seq.append(sq_states.swapaxes(0, 1))
+        assert len(new_states_seq) == len(dones_seq) - offset
 
         # new list, do not modify seq_data
-        data = [new_states_seq, *seq_data[1:]]
+        data = [new_states_seq] + [d[offset:] for d in seq_data[1:]]
         super().__init__(data, batch_size, data_fn, random)
 
 
@@ -546,6 +545,7 @@ def test_StateSqDataGenerator():
                                     [0, 7, 8], [0, 17, 18],
                                     [7, 8, 9], [17, 18, 19],
                                     [8, 9, 10], [18, 19, 20]]))
+    assert np.all(np.array(g.data[3]) == np.arange(20).reshape(2,10).T + 1)
     g = StateSqDataGenerator(seq_data, 3, 2, 5, data_fn)
     assert np.all(np.array(g.data[0]) == np.array([
                                     [4, 5, 6], [14, 15, 16],
