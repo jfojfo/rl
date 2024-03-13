@@ -86,7 +86,17 @@ class MultiStepCollector(Collector):
         return np.array(seq).swapaxes(1, 0)
 
     def peek_state(self, seq_len, state):
-        return self.peek_and_append(self.StateIndex, seq_len, state, state - state)
+        sq_states = self.peek_and_append(self.StateIndex, seq_len, state, state - state)
+        elem_done = np.zeros(state.shape[0], dtype=np.int32)
+        sq_dones = self.peek_and_append(self.DoneIndex, seq_len, elem_done, 1 - elem_done)
+        sq_masks = 1 - sq_dones
+        sq_masks = sq_masks[:, ::-1]
+        sq_masks = np.minimum.accumulate(sq_masks, 1)
+        sq_masks = sq_masks[:, ::-1]
+        sq_masks = sq_masks.reshape(sq_masks.shape + (1,) * (sq_states.ndim - sq_masks.ndim))
+        sq_states = sq_states * sq_masks
+        return sq_states
+
 
 
 
