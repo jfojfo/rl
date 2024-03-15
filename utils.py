@@ -99,6 +99,11 @@ class ActionModifierWrapper(gym.Wrapper):
         return self.env.step(action)
 
 
+class NPFrameStack(gym.wrappers.FrameStack):
+    def observation(self, observation):
+        return np.array(super().observation(observation))
+
+
 class MySummaryWriter(SummaryWriter):
     def __init__(self, step=0, steps_to_log=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
