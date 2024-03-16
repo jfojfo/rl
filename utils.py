@@ -192,10 +192,17 @@ class MySummaryWriter(SummaryWriter):
             summary[f'Grad/{name}'] = grad_mean.item()
             summary[f'Grad/{name}:max'] = grad_max.item()
 
-    def summary_loss(self, losses):
+    # op: add
+    def summary_loss(self, losses, op=None):
         summary = self.summary
         for name, loss in losses.items():
-            summary[f'Loss/{name}'] = loss.item()
+            k = f'Loss/{name}'
+            if k not in summary:
+                summary[k] = 0
+            if op == 'add':
+                summary[k] += loss.item()
+            else:
+                summary[k] = loss.item()
 
     def summary_attns(self, attns):
         if not self.check_steps():
