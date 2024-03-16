@@ -104,6 +104,59 @@ class NPFrameStack(gym.wrappers.FrameStack):
         return np.array(super().observation(observation))
 
 
+class NormObsWrapper(gym.Wrapper):
+    def reset(self, **kwargs):
+        obs, *extra = super().reset(**kwargs)
+        return obs / 255.0, *extra
+
+    def step(self, action):
+        obs, *extra = super().step(action)
+        return obs / 255.0, *extra
+
+
+class ExpandDimWrapper(gym.Wrapper):
+    def reset(self, **kwargs):
+        obs, _ = super().reset(**kwargs)
+        return obs[np.newaxis, ...]
+
+    def step(self, action):
+        obs, reward, done, _, info = super().step(action[0])
+        return obs[np.newaxis, ...], np.array([reward]), np.array([done]), info
+
+
+class EnvPoolWrapper(gym.Wrapper):
+    def reset(self, **kwargs):
+        obs, _ = self.env.reset(**kwargs)
+        return obs / 255.0
+
+    def step(self, action):
+        obs, reward, done, _, info = self.env.step(action)
+        return obs / 255.0, reward, done, info
+
+
+class CropFrameWrapper(gym.Wrapper):
+    CropRect = {
+        'Pong': (0, 160, 34, 194),
+        'Breakout': (0, 160, 32, 196),
+    }
+
+    def reset(self, **kwargs):
+        obs, _ = super().reset(**kwargs)
+        return self.observation(obs)
+
+    def step(self, action):
+        obs, reward, done, _, info = super().step(action)
+        return self.observation(obs), reward, done, info
+
+    def observation(self, obs):
+        env_id = self.env_id
+        for k, v in self.CropRect.items():
+            if env_id.startswith(k):
+                left, right, top, bottom = v
+                break
+        return obs
+
+
 class MySummaryWriter(SummaryWriter):
     def __init__(self, step=0, steps_to_log=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -135,7 +188,9 @@ class MySummaryWriter(SummaryWriter):
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
             grad_mean = params.grad.mean()
+            grad_max = params.grad.max()
             summary[f'Grad/{name}'] = grad_mean.item()
+            summary[f'Grad/{name}:max'] = grad_max.item()
 
     def summary_loss(self, losses):
         summary = self.summary
