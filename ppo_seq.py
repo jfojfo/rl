@@ -23,10 +23,10 @@ config = {
     'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
     'model': 'ppo.seq.cnn.ref',
     'model_dir': 'models',
-    'env_id_list': ['Breakout-v5'] * 8,
-    'envpool': True,
-    # 'env_id_list': ['BreakoutNoFrameskip-v4'] * 2,
-    # 'envpool': False,
+    # 'env_id_list': ['Breakout-v5'] * 8,
+    # 'envpool': True,
+    'env_id_list': ['BreakoutNoFrameskip-v4'] * 2,
+    'envpool': False,
     # 'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -207,7 +207,7 @@ class Train:
         return state if not cfg.diff_state else (state - last_state)
 
     @staticmethod
-    def make_env_fn(env_id, seed=None, **kwargs):
+    def make_env_fn(env_id, seed=None, is_train=True, **kwargs):
         if cfg.envpool:
             def _init():
                 import envpool
@@ -215,8 +215,8 @@ class Train:
                     cfg.env_id_list[0],
                     env_type="gym",
                     num_envs=1,
-                    # episodic_life=True,
-                    # reward_clip=True,
+                    episodic_life=is_train,
+                    reward_clip=is_train,
                     seed=seed if seed is not None else np.random.randint(0, 10000),
                 )
                 env = EnvPoolWrapper(env)
@@ -229,11 +229,12 @@ class Train:
                 if env_id.startswith('MsPacman'):
                     n_actions = 5
                 env = ActionModifierWrapper(n_actions, env)
-                # env = gym.wrappers.RecordEpisodeStatistics(env)
-                env = NoopResetEnv(env, noop_max=30)
+                if is_train:
+                    env = NoopResetEnv(env, noop_max=30)
                 env = MaxAndSkipEnv(env, skip=4)
-                env = EpisodicLifeEnv(env)
-                env = ClipRewardEnv(env)
+                if is_train:
+                    env = EpisodicLifeEnv(env)
+                    env = ClipRewardEnv(env)
                 env = gym.wrappers.ResizeObservation(env, (84, 84))
                 env = gym.wrappers.GrayScaleObservation(env)
                 env = NormObsWrapper(env)
@@ -243,15 +244,15 @@ class Train:
             return _init
 
     @staticmethod
-    def make_envs():
+    def make_envs(is_train=True):
         if cfg.envpool:
             import envpool
             envs = envpool.make(
                 cfg.env_id_list[0],
                 env_type="gym",
                 num_envs=len(cfg.env_id_list),
-                episodic_life=True,
-                reward_clip=True,
+                episodic_life=is_train,
+                reward_clip=is_train,
                 seed=np.random.randint(0, 10000),
             )
             envs = EnvPoolWrapper(envs)
@@ -264,7 +265,7 @@ class Train:
     @staticmethod
     def make_test_env(**kwargs):
         env_id = cfg.env_id_list[0]
-        fn = Train.make_env_fn(env_id, **kwargs)
+        fn = Train.make_env_fn(env_id, is_train=False, **kwargs)
         env_test = fn()
         if not cfg.envpool:
             env_test = ExpandDimWrapper(env_test)
