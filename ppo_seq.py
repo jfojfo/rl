@@ -325,7 +325,7 @@ class Train:
 
     def begin_epoch_optimize(self, epoch):
         self.writer.update_global_step(epoch)
-        lr = cfg.lr * (1.0 - (epoch / cfg.max_epoch))
+        lr = max(cfg.lr * (1.0 - (epoch / cfg.max_epoch)), cfg.lr / 25)
         self.writer.add_scalar("lr", lr, epoch)
         self.optimizer.param_groups[0]["lr"] = lr
 
@@ -565,6 +565,14 @@ class Train:
             reward, steps = self.test_env(env_test, model)
             print(f"steps {steps}, reward {reward}")
 
+    def analysis(self, load_from=None):
+        env_test = self.make_test_env()
+        num_outputs = cfg.n_actions = cfg.transformer.action_dim = env_test.action_space.n
+        model = self.get_model(cfg, num_outputs).to(cfg.device)
+        self.load_model(load_from, model, None)
+        for name, param in model.named_parameters():
+            self.writer.add_histogram(f'Model/{name}', param.flatten(), self.writer.global_step, yscale="percentage")
+
 
 class SeqTrain(Train):
     def process_episodes(self, seq_data):
@@ -670,15 +678,22 @@ def eval(load_from=None):
     get_trainer().eval(load_from)
 
 
+def analysis(load_from=None):
+    get_trainer().analysis(args.model)
+    
+
 if __name__ == "__main__":
     # python ppo_pong.py --eval --model models/ppo_pong.diff.5200.pth
     ap = argparse.ArgumentParser(description='Process args.')
     ap.add_argument('--eval', action='store_true', help='evaluate')
+    ap.add_argument('--analysis', action='store_true', help='analysis')
     ap.add_argument('--model', type=str, default=None, help='model to load')
     args = ap.parse_args(args=[]) if cfg.run_in_notebook else ap.parse_args()
 
     os.makedirs(os.path.join(cfg.model_dir, cfg.model), mode=0o755, exist_ok=True)
-    if not args.eval:
-        train(args.model)
-    else:
+    if args.eval:
         eval(args.model)
+    elif args.analysis:
+        analysis(args.model)
+    else:
+        train(args.model)
