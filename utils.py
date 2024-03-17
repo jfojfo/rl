@@ -209,14 +209,14 @@ class MySummaryWriter(SummaryWriter):
             summary[f'Grad/{name}'] = grad_mean.item()
             summary[f'Grad/{name}:max'] = grad_max.item()
 
-    # op: add
-    def summary_loss(self, losses, op=None):
+    def summary_loss(self, losses, weight=None):
         for name, loss in losses.items():
             k = f'Loss/{name}'
-            if op == 'add':
+            if weight is not None:
                 if k not in self.summary_cum:
-                    self.summary_cum[k] = 0
-                self.summary_cum[k] += loss.item()
+                    self.summary_cum[k] = [0, 0]
+                self.summary_cum[k][0] += loss.item() * weight
+                self.summary_cum[k][1] += weight
             else:
                 self.summary[k] = loss.item()
 
@@ -226,11 +226,11 @@ class MySummaryWriter(SummaryWriter):
         for i, attn in enumerate(attns):
             self.summary_images[f'Attention/{i}'] = attn
 
-    def write_summary(self, div=1.0):
+    def write_summary(self):
         for k, v in self.summary.items():
             self.add_scalar(k, v, self.global_step)
-        for k, v in self.summary_cum.items():
-            self.add_scalar(k, v / div, self.global_step)
+        for k, [v, w] in self.summary_cum.items():
+            self.add_scalar(k, v / w, self.global_step)
         for k, img in self.summary_images.items():
             self.add_image(k, img, self.global_step)
         self.summary = {}

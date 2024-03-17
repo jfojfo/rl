@@ -177,9 +177,9 @@ def loss_ppo(trainer, data_loader, states, actions, old_log_probs, old_values, r
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
     actor_loss = -torch.min(surr1, surr2).sum() / len(data_loader)
-    
-    actor_clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().sum() / len(data_loader)
-    trainer.writer.summary_loss({'actor_clip_fracs': actor_clip_fracs}, op='add')
+
+    actor_clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().mean()
+    trainer.writer.summary_loss({'actor_clip_fracs': actor_clip_fracs}, weight=len(data_loader))
 
     critic_loss = (values - rewards).pow(2)
     if cfg.value_clip is not None:
@@ -187,8 +187,8 @@ def loss_ppo(trainer, data_loader, states, actions, old_log_probs, old_values, r
         clipped_critic_loss = (clipped_values - rewards).pow(2)
         critic_loss = torch.max(critic_loss, clipped_critic_loss)
 
-        critic_clip_fracs = ((values - old_values).abs() > cfg.value_clip).float().sum() / len(data_loader)
-        trainer.writer.summary_loss({'critic_clip_fracs': critic_clip_fracs}, op='add')
+        critic_clip_fracs = ((values - old_values).abs() > cfg.value_clip).float().mean()
+        trainer.writer.summary_loss({'critic_clip_fracs': critic_clip_fracs}, weight=len(data_loader))
 
     critic_loss = 0.5 * critic_loss.sum() / len(data_loader)
     entropy_loss = -entropy.sum() / len(data_loader)
@@ -502,7 +502,7 @@ class Train:
                         minibatch_loader = self.get_minibatch_loader(chunk_loader, cfg.max_batch_size, self.data_fn, False, *chunk)
                         self.optimise_by_minibatch(model, optimizer, minibatch_loader)
                 # write summary once after optimise_times to prevent duplicate
-                writer.write_summary(div=chunk_loader.get_iter() * cfg.optimise_times)
+                writer.write_summary()
 
                 # need reset for training episodely
                 reset_state = self.end_epoch_optimize(epoch, envs)
