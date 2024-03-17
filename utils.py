@@ -4,6 +4,7 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from PIL import Image
 import gymnasium as gym
+from stable_baselines3.common.atari_wrappers import ClipRewardEnv, EpisodicLifeEnv
 
 
 normal_repr = torch.Tensor.__repr__
@@ -99,6 +100,21 @@ class ActionModifierWrapper(gym.Wrapper):
         return self.env.step(action)
 
 
+class KeepInfoClipRewardEnv(ClipRewardEnv):
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info['reward'] = reward
+        return obs, self.reward(reward), terminated, truncated, info
+
+
+class KeepInfoEpisodicLifeEnv(EpisodicLifeEnv):
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        lives = info['lives']
+        info['terminated'] = terminated and lives == 0
+        return obs, reward, terminated, truncated, info
+
+
 class NPFrameStack(gym.wrappers.FrameStack):
     def observation(self, observation):
         return np.array(super().observation(observation))
@@ -164,6 +180,7 @@ class MySummaryWriter(SummaryWriter):
         self.steps_to_log = steps_to_log
         self.summary = {}
         self.summary_images = {}
+        self.summary_cum = {}
 
     def update_global_step(self, global_step):
         self.global_step = global_step
@@ -194,15 +211,14 @@ class MySummaryWriter(SummaryWriter):
 
     # op: add
     def summary_loss(self, losses, op=None):
-        summary = self.summary
         for name, loss in losses.items():
             k = f'Loss/{name}'
-            if k not in summary:
-                summary[k] = 0
             if op == 'add':
-                summary[k] += loss.item()
+                if k not in self.summary_cum:
+                    self.summary_cum[k] = 0
+                self.summary_cum[k] += loss.item()
             else:
-                summary[k] = loss.item()
+                self.summary[k] = loss.item()
 
     def summary_attns(self, attns):
         if not self.check_steps():
@@ -210,12 +226,15 @@ class MySummaryWriter(SummaryWriter):
         for i, attn in enumerate(attns):
             self.summary_images[f'Attention/{i}'] = attn
 
-    def write_summary(self):
+    def write_summary(self, div=1.0):
         for k, v in self.summary.items():
             self.add_scalar(k, v, self.global_step)
+        for k, v in self.summary_cum.items():
+            self.add_scalar(k, v / div, self.global_step)
         for k, img in self.summary_images.items():
             self.add_image(k, img, self.global_step)
         self.summary = {}
+        self.summary_cum = {}
         self.summary_images = {}
 
 

@@ -23,10 +23,10 @@ config = {
     'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
     'model': 'ppo.seq.cnn.ref',
     'model_dir': 'models',
-    # 'env_id_list': ['Breakout-v5'] * 8,
-    # 'envpool': True,
-    'env_id_list': ['BreakoutNoFrameskip-v4'] * 2,
-    'envpool': False,
+    'env_id_list': ['Breakout-v5'] * 8,
+    'envpool': True,
+    # 'env_id_list': ['BreakoutNoFrameskip-v4'] * 2,
+    # 'envpool': False,
     # 'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -75,11 +75,6 @@ config = {
 cfg = Config(**config)
 cfg.transformer.window_size = cfg.seq_len - 1
 cfg.transformer.action_dim = cfg.n_actions
-
-random.seed(1)
-np.random.seed(1)
-torch.manual_seed(1)
-torch.backends.cudnn.deterministic = True
 
 
 class CNN3dModel2(nn.Module):
@@ -183,14 +178,17 @@ def loss_ppo(trainer, data_loader, states, actions, old_log_probs, old_values, r
     surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
     actor_loss = -torch.min(surr1, surr2).sum() / len(data_loader)
     
-    clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().sum() / len(data_loader)
-    trainer.writer.summary_loss({'clip_fracs': clip_fracs}, op='add')
+    actor_clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().sum() / len(data_loader)
+    trainer.writer.summary_loss({'actor_clip_fracs': actor_clip_fracs}, op='add')
 
     critic_loss = (values - rewards).pow(2)
     if cfg.value_clip is not None:
         clipped_values = old_values + torch.clamp(values - old_values, -cfg.value_clip, cfg.value_clip)
         clipped_critic_loss = (clipped_values - rewards).pow(2)
         critic_loss = torch.max(critic_loss, clipped_critic_loss)
+
+        critic_clip_fracs = ((values - old_values).abs() > cfg.value_clip).float().sum() / len(data_loader)
+        trainer.writer.summary_loss({'critic_clip_fracs': critic_clip_fracs}, op='add')
 
     critic_loss = 0.5 * critic_loss.sum() / len(data_loader)
     entropy_loss = -entropy.sum() / len(data_loader)
@@ -213,7 +211,7 @@ class Train:
                 import envpool
                 env = envpool.make(
                     cfg.env_id_list[0],
-                    env_type="gym",
+                    env_type="gymnasium",
                     num_envs=1,
                     episodic_life=is_train,
                     reward_clip=is_train,
@@ -233,8 +231,8 @@ class Train:
                     env = NoopResetEnv(env, noop_max=30)
                 env = MaxAndSkipEnv(env, skip=4)
                 if is_train:
-                    env = EpisodicLifeEnv(env)
-                    env = ClipRewardEnv(env)
+                    env = KeepInfoEpisodicLifeEnv(env)
+                    env = KeepInfoClipRewardEnv(env)
                 env = gym.wrappers.ResizeObservation(env, (84, 84))
                 env = gym.wrappers.GrayScaleObservation(env)
                 env = NormObsWrapper(env)
@@ -249,7 +247,7 @@ class Train:
             import envpool
             envs = envpool.make(
                 cfg.env_id_list[0],
-                env_type="gym",
+                env_type="gymnasium",
                 num_envs=len(cfg.env_id_list),
                 episodic_life=is_train,
                 reward_clip=is_train,
@@ -477,9 +475,11 @@ class Train:
                     state[i] = next_state[i]
             next_state_ = self.diff_state(next_state, state)
             if cfg.envpool:
-                extra.append(info['lives'])
+                # extra.append(info['lives'])
+                extra.append([{'terminated': t, 'reward': r} for t, r in zip(info['terminated'], info['reward'])])
             else:
-                extra.append([v['lives'] for v in info])
+                # extra.append([v['lives'] for v in info])
+                extra.append(info)
             collector.add(state_, action, reward, done, next_state_, *extra)
 
             last_state, state = state, next_state
@@ -502,7 +502,7 @@ class Train:
                         minibatch_loader = self.get_minibatch_loader(chunk_loader, cfg.max_batch_size, self.data_fn, False, *chunk)
                         self.optimise_by_minibatch(model, optimizer, minibatch_loader)
                 # write summary once after optimise_times to prevent duplicate
-                writer.write_summary()
+                writer.write_summary(div=chunk_loader.get_iter() * cfg.optimise_times)
 
                 # need reset for training episodely
                 reset_state = self.end_epoch_optimize(epoch, envs)
@@ -597,11 +597,11 @@ class SeqTrain(Train):
 
         rewards = seq_data[self.collector.RewardIndex]
         dones = seq_data[self.collector.DoneIndex]
-        lives = seq_data[-1]
-        for reward, done, life in zip(rewards, dones, lives):
-            self.total_reward_1_env += reward[0]
+        infos = seq_data[-1]
+        for info in infos:
+            self.total_reward_1_env += info[0]['reward']
             self.steps_1_env += 1
-            if done[0] and life[0] == 0:
+            if info[0]['terminated']:
                 self.total_runs_1_env += 1
                 print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
                 self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
