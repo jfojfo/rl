@@ -43,6 +43,7 @@ config = {
     'lam': 0.95,
     'surr_clip': 0.1,
     'value_clip': 0.1,
+    'grad_norm': 0.5,
 
     'transformer': {
         'num_blocks': 1,
@@ -325,6 +326,7 @@ class Train:
     def begin_epoch_optimize(self, epoch):
         self.writer.update_global_step(epoch)
         lr = cfg.lr * (1.0 - (epoch / cfg.max_epoch))
+        self.writer.add_scalar("lr", lr, epoch)
         self.optimizer.param_groups[0]["lr"] = lr
 
     def end_epoch_optimize(self, epoch, envs):
@@ -397,8 +399,8 @@ class Train:
     #     return total_samples
 
     def recalc_episode(self, episode):
-        ep_states, ep_actions, ep_rewards, ep_dones, ep_log_probs, ep_values, ep_lives = episode
-        episode.pop()
+        ep_states, ep_actions, ep_rewards, ep_dones, ep_log_probs, ep_values, *_ = episode
+        del episode[6:]
         ep_rewards = np.array(ep_rewards)
         ep_discount_rewards = discount_rewards_episodely(ep_rewards, cfg.gamma)
         ep_discount_rewards /= (np.abs(ep_discount_rewards).max() + 1e-8)
@@ -430,8 +432,9 @@ class Train:
 
             keys = set(acc_loss).union(loss_dict)
             acc_loss = {key: acc_loss.get(key, 0) + loss_dict.get(key, 0) for key in keys}
-        nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        total_grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_norm)
         optimizer.step()
+        self.writer.summary_loss({'grad_norm': total_grad_norm}, weight=1)
         self.writer.summary_loss(acc_loss)
 
     def train(self, load_from):
@@ -570,7 +573,7 @@ class SeqTrain(Train):
             next_action, next_log_prob, next_value = self.predict_action(*self.model(*params))
 
         self.update_1_env(seq_data)
-        seq_data.pop()
+        del seq_data[6:]
 
         sq_states, sq_actions, sq_rewards, sq_dones, sq_log_probs, sq_values = seq_data
         sq_discount_rewards = discount_gae(sq_rewards, sq_dones, sq_values, next_value, cfg.gamma, cfg.lam)
