@@ -206,19 +206,19 @@ class MySummaryWriter(SummaryWriter):
             loss.backward(retain_graph=True)
             grad_mean = params.grad.mean()
             grad_max = params.grad.max()
-            summary[f'Grad/{name}'] = grad_mean.item()
-            summary[f'Grad/{name}:max'] = grad_max.item()
+            self.stash_summary('Grad', {name: grad_mean, f'{name}:max': grad_max})
 
     def summary_loss(self, losses, weight=None):
-        for name, loss in losses.items():
-            k = f'Loss/{name}'
-            if weight is not None:
-                if k not in self.summary_cum:
-                    self.summary_cum[k] = [0, 0]
-                self.summary_cum[k][0] += loss.item() * weight
-                self.summary_cum[k][1] += weight
-            else:
-                self.summary[k] = loss.item()
+        self.stash_summary('Loss', losses, weight)
+        # for name, loss in losses.items():
+        #     k = f'Loss/{name}'
+        #     if weight is not None:
+        #         if k not in self.summary_cum:
+        #             self.summary_cum[k] = [0, 0]
+        #         self.summary_cum[k][0] += loss * weight
+        #         self.summary_cum[k][1] += weight
+        #     else:
+        #         self.summary[k] = loss
 
     def summary_attns(self, attns):
         if not self.check_steps():
@@ -226,16 +226,42 @@ class MySummaryWriter(SummaryWriter):
         for i, attn in enumerate(attns):
             self.summary_images[f'Attention/{i}'] = attn
 
+    def stash_summary(self, tag, sum_dict, weight=None):
+        summary = self.summary.get(tag, {})
+        self.summary[tag] = summary
+        for k, v in sum_dict.items():
+            if weight is None:
+                summary[k] = v
+            else:
+                if k not in summary:
+                    summary[k] = [0, 0]
+                summary[k][0] += v * weight
+                summary[k][1] += weight
+
     def write_summary(self):
-        for k, v in self.summary.items():
-            self.add_scalar(k, v, self.global_step)
-        for k, [v, w] in self.summary_cum.items():
-            self.add_scalar(k, v / w, self.global_step)
+        for tag, summary in self.summary.items():
+            for name, v in summary.items():
+                if type(v) is list:
+                    v = v[0] / v[1]
+                self.add_scalar(f'{tag}/{name}', v, self.global_step)
+
         for k, img in self.summary_images.items():
             self.add_image(k, img, self.global_step)
+
         self.summary = {}
-        self.summary_cum = {}
         self.summary_images = {}
+
+    def pop_summary(self, tag):
+        ret = {}
+        summary = self.summary.pop(tag, {})
+        for name, v in summary.items():
+            if type(v) is list:
+                v = v[0] / v[1]
+            ret[name] = v
+        return ret
+
+    def flush_summary(self):
+        self.write_summary()
 
 
 # along axis 0

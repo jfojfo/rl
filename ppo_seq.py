@@ -21,7 +21,7 @@ from stable_baselines3.common.atari_wrappers import (
 
 config = {
     'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'ppo.seq.cnn.ref',
+    'model': 'ppo.seq.cnn.good',
     'model_dir': 'models',
     'env_id_list': ['Breakout-v5'] * 8,
     'envpool': True,
@@ -30,20 +30,20 @@ config = {
     # 'env_id_list': ['Pong-v4', 'Breakout-v4', 'SpaceInvaders-v4', 'MsPacman-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'ppo.seq.cnn.ref',
+    # 'wandb': 'ppo.seq.cnn.good',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
 
-    'lr': 2.5e-4,
+    'lr': 1.5e-4,
     'hidden_dim': 512,  # hidden size, linear units of the output layer
     'c_critic': 1.0,  # critic coefficient
     'c_entropy': 0.01,  # entropy coefficient
     'gamma': 0.99,
     'lam': 0.95,
-    'surr_clip': 0.1,
-    'value_clip': 0.1,
-    'grad_norm': 0.5,
+    'surr_clip': 0.2,
+    'value_clip': 0.2,
+    'grad_norm': 10.0,
 
     'transformer': {
         'num_blocks': 1,
@@ -62,13 +62,13 @@ config = {
     'n_actions': 6,
     'optimise_times': 4,  # optimise times per epoch
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
-    'chunk_percent': 1/4,  # split into chunks, do optimise per chunk
+    'chunk_percent': 1/8,  # split into chunks, do optimise per chunk
     'chunk_size': None,
     'seq_len': 11,
-    'epoch_size': 128,
+    'epoch_size': 256,
     'epoch_episodes': 8,
     'epoch_save': 300,
-    'max_epoch': 12000,
+    'max_epoch': 8000,
     'target_reward': 20000000,
     'diff_state': False,
     'shuffle': True,
@@ -180,16 +180,16 @@ def loss_ppo(trainer, data_loader, states, actions, old_log_probs, old_values, r
     actor_loss = -torch.min(surr1, surr2).sum() / len(data_loader)
 
     actor_clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().mean()
-    trainer.writer.summary_loss({'actor_clip_fracs': actor_clip_fracs}, weight=len(data_loader))
+    trainer.writer.stash_summary('Monitor', {'actor_clip_fracs': actor_clip_fracs}, weight=len(data_loader))
 
     critic_loss = (values - rewards).pow(2)
     if cfg.value_clip is not None:
-        clipped_values = old_values + torch.clamp(values - old_values, -cfg.value_clip, cfg.value_clip)
-        clipped_critic_loss = (clipped_values - rewards).pow(2)
-        critic_loss = torch.max(critic_loss, clipped_critic_loss)
+        # clipped_values = old_values + torch.clamp(values - old_values, -cfg.value_clip, cfg.value_clip)
+        # clipped_critic_loss = (clipped_values - rewards).pow(2)
+        # critic_loss = torch.max(critic_loss, clipped_critic_loss)
 
         critic_clip_fracs = ((values - old_values).abs() > cfg.value_clip).float().mean()
-        trainer.writer.summary_loss({'critic_clip_fracs': critic_clip_fracs}, weight=len(data_loader))
+        trainer.writer.stash_summary('Monitor', {'critic_clip_fracs': critic_clip_fracs}, weight=len(data_loader))
 
     critic_loss = 0.5 * critic_loss.sum() / len(data_loader)
     entropy_loss = -entropy.sum() / len(data_loader)
@@ -325,7 +325,7 @@ class Train:
 
     def begin_epoch_optimize(self, epoch):
         self.writer.update_global_step(epoch)
-        lr = max(cfg.lr * (1.0 - (epoch / cfg.max_epoch)), cfg.lr / 25)
+        lr = max(cfg.lr * (1.0 - (epoch / cfg.max_epoch)), cfg.lr / 10)
         self.writer.add_scalar("lr", lr, epoch)
         self.optimizer.param_groups[0]["lr"] = lr
 
@@ -434,7 +434,7 @@ class Train:
             acc_loss = {key: acc_loss.get(key, 0) + loss_dict.get(key, 0) for key in keys}
         total_grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_norm)
         optimizer.step()
-        self.writer.summary_loss({'grad_norm': total_grad_norm}, weight=1)
+        self.writer.stash_summary('Grad', {'grad_norm': total_grad_norm}, weight=1)
         self.writer.summary_loss(acc_loss)
 
     def train(self, load_from):
@@ -504,7 +504,9 @@ class Train:
                         # minibatch don't exceeds cfg.max_batch_size
                         minibatch_loader = self.get_minibatch_loader(chunk_loader, cfg.max_batch_size, self.data_fn, False, *chunk)
                         self.optimise_by_minibatch(model, optimizer, minibatch_loader)
+                        monitor_summary = self.writer.pop_summary('Monitor')
                 # write summary once after optimise_times to prevent duplicate
+                self.writer.stash_summary('Monitor', monitor_summary)
                 writer.write_summary()
 
                 # need reset for training episodely
@@ -584,10 +586,10 @@ class SeqTrain(Train):
         del seq_data[6:]
 
         sq_states, sq_actions, sq_rewards, sq_dones, sq_log_probs, sq_values = seq_data
-        sq_discount_rewards = discount_gae(sq_rewards, sq_dones, sq_values, next_value, cfg.gamma, cfg.lam)
-        # sq_discount_rewards = np.array(sq_discount_rewards)
-        # sq_discount_rewards = sq_discount_rewards / np.sqrt(np.abs(sq_discount_rewards).max())
-        # sq_discount_rewards = list(sq_discount_rewards)
+        sq_values_pow = list(np.sign(sq_values) * np.power(sq_values, 2))
+        next_value_pow = np.sign(next_value) * np.power(next_value, 2)
+        sq_discount_rewards = discount_gae(sq_rewards, sq_dones, sq_values_pow, next_value_pow, cfg.gamma, cfg.lam)
+        sq_discount_rewards = list(np.sign(sq_discount_rewards) * np.sqrt(np.abs(sq_discount_rewards)))
 
         seq_data.insert(len(seq_data), sq_discount_rewards)
         sq_advantages = [discount_reward - value for discount_reward, value in zip(sq_discount_rewards, sq_values)]
