@@ -21,7 +21,7 @@ from stable_baselines3.common.atari_wrappers import (
 
 config = {
     'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'ppo.seq.cnn.good',
+    'model': 'ppo.seq.cnn.good.scaled_sigmoid',
     'model_dir': 'models',
     'env_id_list': ['Breakout-v5'] * 8,
     'envpool': True,
@@ -139,7 +139,24 @@ class CNNModel2(nn.Module):
         logits = self.actor(feature)
         dist = Categorical(logits=logits)
         value = self.critic(feature)
+        value = scaled_sigmoid(value)
         return dist, value
+
+
+def signed_sqrt(x):
+    return x.sign() * x.abs().sqrt()
+
+def signed_power(x):
+    return x.sign() * x.pow(2)
+
+def scaled_sigmoid(x):
+    # return (2 / (1 + np.exp(-x / 100)) - 1) * 20
+    # return (2 / (1 + np.exp(-np.sqrt(x) / 9)) - 1) * 20
+    # return (2 / (1 + (-x.abs().sqrt() * x.sign() / 9).exp()) - 1) * 20
+    return (2 / (1 + (-signed_sqrt(x) / 9).exp()) - 1) * 20
+
+def reverse_scaled_sigmoid(x):
+    return signed_power(-(2 / (x / 20 + 1) - 1).log() * 9)
 
 
 def discount_gae(rewards, dones, values, next_value, gamma=0.99, lam=0.95):
@@ -586,10 +603,10 @@ class SeqTrain(Train):
         del seq_data[6:]
 
         sq_states, sq_actions, sq_rewards, sq_dones, sq_log_probs, sq_values = seq_data
-        sq_values_pow = list(np.sign(sq_values) * np.power(sq_values, 2))
-        next_value_pow = np.sign(next_value) * np.power(next_value, 2)
-        sq_discount_rewards = discount_gae(sq_rewards, sq_dones, sq_values_pow, next_value_pow, cfg.gamma, cfg.lam)
-        sq_discount_rewards = list(np.sign(sq_discount_rewards) * np.sqrt(np.abs(sq_discount_rewards)))
+        sq_values_scaled = reverse_scaled_sigmoid(torch.as_tensor(np.array(sq_values))).numpy()
+        next_value_scaled = reverse_scaled_sigmoid(torch.as_tensor(next_value)).numpy()
+        sq_discount_rewards = discount_gae(sq_rewards, sq_dones, sq_values_scaled, next_value_scaled, cfg.gamma, cfg.lam)
+        sq_discount_rewards = list(scaled_sigmoid(torch.as_tensor(np.array(sq_discount_rewards))).numpy())
 
         seq_data.insert(len(seq_data), sq_discount_rewards)
         sq_advantages = [discount_reward - value for discount_reward, value in zip(sq_discount_rewards, sq_values)]
@@ -618,6 +635,7 @@ class SeqTrain(Train):
                 self.total_runs_1_env += 1
                 print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
                 self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
+                self.writer.add_scalar('Reward/env_1_step', self.steps_1_env, self.writer.global_step)
                 self.total_reward_1_env = 0
                 self.steps_1_env = 0
 
