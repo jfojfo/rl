@@ -21,13 +21,13 @@ from stable_baselines3.common.atari_wrappers import (
 
 config = {
     'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'ppo.seq.cnn.good.multigames',
+    'model': 'ppo.seq.cnn.good.scaled_sigmoid',
     'model_dir': 'models',
-    # 'env_id_list': ['Breakout-v5'] * 8,
-    # 'envpool': True,
+    'env_id_list': ['Breakout-v5'] * 8,
+    'envpool': True,
     # 'env_id_list': ['BreakoutNoFrameskip-v4'] * 2,
-    'envpool': False,
-    'env_id_list': 2 * ['PongNoFrameskip-v4', 'BreakoutNoFrameskip-v4', 'SpaceInvadersNoFrameskip-v4', 'MsPacmanNoFrameskip-v4'],
+    # 'envpool': False,
+    # 'env_id_list': ['PongNoFrameskip-v4', 'BreakoutNoFrameskip-v4', 'SpaceInvadersNoFrameskip-v4', 'MsPacmanNoFrameskip-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     # 'wandb': 'ppo.seq.cnn.good',
@@ -67,15 +67,17 @@ config = {
     'seq_len': 11,
     'epoch_size': 256,
     'epoch_episodes': 8,
-    'epoch_save': 600,
-    'max_epoch': 26000,
+    'epoch_save': 300,
+    'max_epoch': 8000,
     'target_reward': 20000000,
     'diff_state': False,
     'shuffle': True,
 }
 cfg = Config(**config)
 cfg.transformer.window_size = cfg.seq_len - 1
-cfg.transformer.action_dim = cfg.n_actions
+env_ = gym.make(cfg.env_id_list[0])
+cfg.n_actions = cfg.transformer.action_dim = env_.action_space.n
+del env_
 
 
 class CNN3dModel2(nn.Module):
@@ -495,12 +497,11 @@ class Train:
                     state[i] = next_state[i]
             next_state_ = self.diff_state(next_state, state)
             if cfg.envpool:
-                # extra.append([{'terminated': t, 'reward': r} for t, r in zip(info['terminated'], info['reward'])])
-                extra.append(info)
+                # extra.append(info['lives'])
+                extra.append([{'terminated': t, 'reward': r} for t, r in zip(info['terminated'], info['reward'])])
             else:
-                # extra.append(info)
-                extra.append({'terminated': np.array([d['terminated'] for d in info], dtype=np.int32),
-                              'reward': np.array([d['reward'] for d in info])})
+                # extra.append([v['lives'] for v in info])
+                extra.append(info)
             collector.add(state_, action, reward, done, next_state_, *extra)
 
             last_state, state = state, next_state
@@ -617,53 +618,28 @@ class SeqTrain(Train):
         total_samples = len(sq_states) * len(sq_states[0])
         return total_samples
 
-    # def update_1_env(self, seq_data):
-    #     offset = len(seq_data[0]) - cfg.epoch_size
-    #     seq_data = [d[offset:] for d in seq_data]
-
-    #     if not hasattr(self, 'total_runs_1_env'):
-    #         self.total_runs_1_env = 0
-    #         self.steps_1_env = 0
-    #         self.total_reward_1_env = 0
-
-    #     rewards = seq_data[self.collector.RewardIndex]
-    #     dones = seq_data[self.collector.DoneIndex]
-    #     infos = seq_data[-1]
-    #     for info in infos:
-    #         self.total_reward_1_env += info[0]['reward']
-    #         self.steps_1_env += 1
-    #         if info[0]['terminated']:
-    #             self.total_runs_1_env += 1
-    #             print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
-    #             self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
-    #             self.writer.add_scalar('Reward/env_1_step', self.steps_1_env, self.writer.global_step)
-    #             self.total_reward_1_env = 0
-    #             self.steps_1_env = 0
-
     def update_1_env(self, seq_data):
         offset = len(seq_data[0]) - cfg.epoch_size
         seq_data = [d[offset:] for d in seq_data]
 
-        if not hasattr(self, 'total_runs'):
-            self.total_runs = np.zeros(len(cfg.env_id_list), dtype=np.int32)
-            self.total_steps = np.zeros(len(cfg.env_id_list), dtype=np.int32)
-            self.total_rewards = np.zeros(len(cfg.env_id_list), dtype=np.float32)
+        if not hasattr(self, 'total_runs_1_env'):
+            self.total_runs_1_env = 0
+            self.steps_1_env = 0
+            self.total_reward_1_env = 0
 
+        rewards = seq_data[self.collector.RewardIndex]
+        dones = seq_data[self.collector.DoneIndex]
         infos = seq_data[-1]
-        terminated = [info['terminated'] for info in infos]
-        real_rewards = [info['reward'] for info in infos]
-
-        for reward, term in zip(real_rewards, terminated):
-            self.total_steps += 1
-            self.total_rewards += reward
-            self.total_runs += term
-            for i in np.where(term == 1)[0]:
-                env_name = cfg.env_id_list[i]
-                print(f'Epoch {self.writer.global_step} Env {i+1} Run {self.total_runs[i]}: steps {self.total_steps[i]}, Reward {self.total_rewards[i]}, {env_name}')
-                self.writer.add_scalar(f'Reward/{i}/{env_name}', self.total_rewards[i], self.writer.global_step)
-                self.writer.add_scalar(f'Steps/{i}/{env_name}', self.total_steps[i], self.writer.global_step)
-            self.total_steps *= (1 - term)
-            self.total_rewards *= (1 - term)
+        for info in infos:
+            self.total_reward_1_env += info[0]['reward']
+            self.steps_1_env += 1
+            if info[0]['terminated']:
+                self.total_runs_1_env += 1
+                print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
+                self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
+                self.writer.add_scalar('Reward/env_1_step', self.steps_1_env, self.writer.global_step)
+                self.total_reward_1_env = 0
+                self.steps_1_env = 0
 
     def get_data_collector(self):
         return MultiStepCollector(cfg.epoch_size)
