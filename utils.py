@@ -25,8 +25,8 @@ class Config(SimpleNamespace):
             return value
 
 
-def normalize(data):
-    return (data - data.mean()) / (data.std() + 1e-8)
+def normalize(data, axis=None):
+    return (data - data.mean(axis, keepdims=True)) / (data.std(axis, keepdims=True) + 1e-8)
 
 
 def prepro(I):
