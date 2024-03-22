@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import numpy as np
 import torch
 from torch import einsum, nn
 from torch.distributions import Categorical
@@ -434,3 +435,86 @@ class CNN3d2dModel(nn.Module):
         dist = Categorical(logits=logits)
         value = self.critic(feature)
         return dist, value
+
+
+class CNN3dModel2(nn.Module):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', nn.Conv3d(in_channels=1, out_channels=32, kernel_size=(3, 8, 8), stride=(2, 4, 4), padding=(0, 2, 2))),
+            ('act1', nn.ReLU()),
+            ('conv2', nn.Conv3d(in_channels=32, out_channels=64, kernel_size=(3, 4, 4), stride=2, padding=(0, 1, 1))),
+            ('act2', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=64 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
+            ('act3', nn.ReLU()),
+        ]))
+        self.actor = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(in_features=cfg.hidden_dim, out_features=1),
+        )
+
+    def forward(self, x: torch.Tensor):
+        x = x.permute(0, 2, 1, 3, 4)
+        feature = self.feature(x)
+        logits = self.actor(feature)
+        dist = Categorical(logits=logits)
+        value = self.critic(feature)
+        return dist, value
+
+
+class CNNModel2(nn.Module):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', layer_init(nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding=0))),
+            ('act1', nn.ReLU()),
+            ('conv2', layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0))),
+            ('act2', nn.ReLU()),
+            ('conv3', layer_init(nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0))),
+            ('act3', nn.ReLU()),
+            ('flatten', nn.Flatten()),
+            ('linear', nn.Linear(in_features=64 * 7 * 7, out_features=cfg.hidden_dim)),
+            ('act', nn.ReLU()),
+        ]))
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs), std=0.01),
+        )
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=1), std=1),
+        )
+
+    def forward(self, x: torch.Tensor):
+        feature = self.feature(x)
+        logits = self.actor(feature)
+        dist = Categorical(logits=logits)
+        value = self.critic(feature)
+        value = scaled_sigmoid(value)
+        return dist, value
+
+
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+def signed_sqrt(x):
+    return x.sign() * x.abs().sqrt()
+
+def signed_power(x):
+    return x.sign() * x.pow(2)
+
+def scaled_sigmoid(x):
+    # return (2 / (1 + np.exp(-x / 100)) - 1) * 20
+    # return (2 / (1 + np.exp(-np.sqrt(x) / 9)) - 1) * 20
+    # return (2 / (1 + (-x.abs().sqrt() * x.sign() / 9).exp()) - 1) * 20
+    return (2 / (1 + (-signed_sqrt(x) / 9).exp()) - 1) * 20
+
+def reverse_scaled_sigmoid(x):
+    return signed_power(-(2 / (x / 20 + 1) - 1).log() * 9)

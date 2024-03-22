@@ -45,20 +45,6 @@ config = {
     'value_clip': 0.2,
     'grad_norm': 10.0,
 
-    'transformer': {
-        'num_blocks': 1,
-        'dim_input': 128,  # dim_head * num_heads
-        'dim_head': 16,
-        'num_heads': 8,
-        'state_dim': 80 * 80,
-        'action_dim': 6,
-        'reward_dim': 1,
-        # 'window_size': 256,  # seq_len - 1
-        'layer_norm': 'pre',  # pre/post
-        'positional_encoding': 'none',  # relative/learned/rotary
-        'dropout': 0.0,
-    },
-
     'n_actions': 6,
     'optimise_times': 4,  # optimise times per epoch
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
@@ -72,93 +58,26 @@ config = {
     'target_reward': 20000000,
     'diff_state': False,
     'shuffle': True,
+
+    'transformer': {
+        'num_blocks': 1,
+        'dim_input': 128,  # dim_head * num_heads
+        'dim_head': 16,
+        'num_heads': 8,
+        'state_dim': 80 * 80,
+        'action_dim': 6,
+        'reward_dim': 1,
+        # 'window_size': 256,  # seq_len - 1
+        'layer_norm': 'pre',  # pre/post
+        'positional_encoding': 'none',  # relative/learned/rotary
+        'dropout': 0.0,
+    },
 }
 cfg = Config(**config)
 cfg.transformer.window_size = cfg.seq_len - 1
 env_ = gym.make(cfg.env_id_list[0])
 cfg.n_actions = cfg.transformer.action_dim = env_.action_space.n
 del env_
-
-
-class CNN3dModel2(nn.Module):
-    def __init__(self, cfg: Config, num_outputs) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.feature = nn.Sequential(OrderedDict([
-            ('conv1', nn.Conv3d(in_channels=1, out_channels=32, kernel_size=(3, 8, 8), stride=(2, 4, 4), padding=(0, 2, 2))),
-            ('act1', nn.ReLU()),
-            ('conv2', nn.Conv3d(in_channels=32, out_channels=64, kernel_size=(3, 4, 4), stride=2, padding=(0, 1, 1))),
-            ('act2', nn.ReLU()),
-            ('flatten', nn.Flatten()),
-            ('linear', nn.Linear(in_features=64 * 2 * 10 * 10, out_features=cfg.hidden_dim)),
-            ('act3', nn.ReLU()),
-        ]))
-        self.actor = nn.Sequential(
-            nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs),
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(in_features=cfg.hidden_dim, out_features=1),
-        )
-
-    def forward(self, x: torch.Tensor):
-        x = x.permute(0, 2, 1, 3, 4)
-        feature = self.feature(x)
-        logits = self.actor(feature)
-        dist = Categorical(logits=logits)
-        value = self.critic(feature)
-        return dist, value
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-class CNNModel2(nn.Module):
-    def __init__(self, cfg: Config, num_outputs) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.feature = nn.Sequential(OrderedDict([
-            ('conv1', layer_init(nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding=0))),
-            ('act1', nn.ReLU()),
-            ('conv2', layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0))),
-            ('act2', nn.ReLU()),
-            ('conv3', layer_init(nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0))),
-            ('act3', nn.ReLU()),
-            ('flatten', nn.Flatten()),
-            ('linear', nn.Linear(in_features=64 * 7 * 7, out_features=cfg.hidden_dim)),
-            ('act', nn.ReLU()),
-        ]))
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=num_outputs), std=0.01),
-        )
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=1), std=1),
-        )
-
-    def forward(self, x: torch.Tensor):
-        feature = self.feature(x)
-        logits = self.actor(feature)
-        dist = Categorical(logits=logits)
-        value = self.critic(feature)
-        value = scaled_sigmoid(value)
-        return dist, value
-
-
-def signed_sqrt(x):
-    return x.sign() * x.abs().sqrt()
-
-def signed_power(x):
-    return x.sign() * x.pow(2)
-
-def scaled_sigmoid(x):
-    # return (2 / (1 + np.exp(-x / 100)) - 1) * 20
-    # return (2 / (1 + np.exp(-np.sqrt(x) / 9)) - 1) * 20
-    # return (2 / (1 + (-x.abs().sqrt() * x.sign() / 9).exp()) - 1) * 20
-    return (2 / (1 + (-signed_sqrt(x) / 9).exp()) - 1) * 20
-
-def reverse_scaled_sigmoid(x):
-    return signed_power(-(2 / (x / 20 + 1) - 1).log() * 9)
 
 
 def discount_gae(rewards, dones, values, next_value, gamma=0.99, lam=0.95):
@@ -497,11 +416,10 @@ class Train:
                     state[i] = next_state[i]
             next_state_ = self.diff_state(next_state, state)
             if cfg.envpool:
-                # extra.append(info['lives'])
-                extra.append([{'terminated': t, 'reward': r} for t, r in zip(info['terminated'], info['reward'])])
-            else:
-                # extra.append([v['lives'] for v in info])
                 extra.append(info)
+            else:
+                extra.append({'terminated': np.array([d['terminated'] for d in info], dtype=np.int32),
+                              'reward': np.array([d['reward'] for d in info])})
             collector.add(state_, action, reward, done, next_state_, *extra)
 
             last_state, state = state, next_state
@@ -618,28 +536,53 @@ class SeqTrain(Train):
         total_samples = len(sq_states) * len(sq_states[0])
         return total_samples
 
+    # def update_1_env(self, seq_data):
+    #     offset = len(seq_data[0]) - cfg.epoch_size
+    #     seq_data = [d[offset:] for d in seq_data]
+
+    #     if not hasattr(self, 'total_runs_1_env'):
+    #         self.total_runs_1_env = 0
+    #         self.steps_1_env = 0
+    #         self.total_reward_1_env = 0
+
+    #     rewards = seq_data[self.collector.RewardIndex]
+    #     dones = seq_data[self.collector.DoneIndex]
+    #     infos = seq_data[-1]
+    #     for info in infos:
+    #         self.total_reward_1_env += info[0]['reward']
+    #         self.steps_1_env += 1
+    #         if info[0]['terminated']:
+    #             self.total_runs_1_env += 1
+    #             print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
+    #             self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
+    #             self.writer.add_scalar('Reward/env_1_step', self.steps_1_env, self.writer.global_step)
+    #             self.total_reward_1_env = 0
+    #             self.steps_1_env = 0
+
     def update_1_env(self, seq_data):
         offset = len(seq_data[0]) - cfg.epoch_size
         seq_data = [d[offset:] for d in seq_data]
 
-        if not hasattr(self, 'total_runs_1_env'):
-            self.total_runs_1_env = 0
-            self.steps_1_env = 0
-            self.total_reward_1_env = 0
+        if not hasattr(self, 'total_runs'):
+            self.total_runs = np.zeros(len(cfg.env_id_list), dtype=np.int32)
+            self.total_steps = np.zeros(len(cfg.env_id_list), dtype=np.int32)
+            self.total_rewards = np.zeros(len(cfg.env_id_list), dtype=np.float32)
 
-        rewards = seq_data[self.collector.RewardIndex]
-        dones = seq_data[self.collector.DoneIndex]
         infos = seq_data[-1]
-        for info in infos:
-            self.total_reward_1_env += info[0]['reward']
-            self.steps_1_env += 1
-            if info[0]['terminated']:
-                self.total_runs_1_env += 1
-                print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
-                self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
-                self.writer.add_scalar('Reward/env_1_step', self.steps_1_env, self.writer.global_step)
-                self.total_reward_1_env = 0
-                self.steps_1_env = 0
+        terminated = [info['terminated'] for info in infos]
+        real_rewards = [info['reward'] for info in infos]
+
+        for reward, term in zip(real_rewards, terminated):
+            self.total_steps += 1
+            self.total_rewards += reward
+            self.total_runs += term
+            for i in np.where(term == 1)[0]:
+                env_name = cfg.env_id_list[i]
+                print(f'Epoch {self.writer.global_step} Env {i+1} Run {self.total_runs[i]}: steps {self.total_steps[i]}, Reward {self.total_rewards[i]}, {env_name}')
+                self.writer.add_scalar(f'Reward/{i}/{env_name}', self.total_rewards[i], self.writer.global_step)
+                self.writer.add_scalar(f'Steps/{i}/{env_name}', self.total_steps[i], self.writer.global_step)
+            self.total_steps *= (1 - term)
+            self.total_rewards *= (1 - term)
 
     def get_data_collector(self):
         return MultiStepCollector(cfg.epoch_size)
