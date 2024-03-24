@@ -264,7 +264,7 @@ class MySummaryWriter(SummaryWriter):
         self.write_summary()
 
 
-# along axis 0
+# along axis 0: seq axis
 def lookback_mask(dones):
     mask = 1 - dones
     mask[-1] = 1  # ... 0 -> ... 1

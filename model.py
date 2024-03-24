@@ -15,6 +15,7 @@ class MyLocalAttention(LocalAttention):
         q = q * (q.shape[-1] ** -0.5)
         if self.rel_pos is not None:
             pos_emb, xpos_scale = self.rel_pos(k)
+            # freqs assigned from back to front
             q, k = apply_rotary_pos_emb(q, k, pos_emb, scale = xpos_scale)
 
         sim = einsum('b h i e, b h j e -> b h i j', q, k)
@@ -136,7 +137,7 @@ class TransformerBaseModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         # memory is needed by inference
-        self.memory = [Memory(cfg.window_size) for _ in range(cfg.num_blocks)]
+        self.memory = [Memory(cfg.window_size, cfg.device) for _ in range(cfg.num_blocks)]
 
         self.feature = nn.Sequential(OrderedDict([
             ('flatten', nn.Flatten(start_dim=2)),
@@ -164,7 +165,7 @@ class TransformerBaseModel(nn.Module):
                 h, attn_weight, mem_kv = block(h, mem_kv, query_mask, key_mask[:, -mask_size:], mode)
                 self.memory[i].set(mem_kv.detach())
             else:
-                h, attn_weight, _ = block(h, Memory.get_empty_mem(), mode=mode)
+                h, attn_weight, _ = block(h, self.memory[i].get_empty_mem(), mode=mode)
             attn_weights.append(attn_weight)
         return h, attn_weights
 
@@ -191,6 +192,74 @@ class TransformerModel(TransformerBaseModel):
         dist = Categorical(logits=logits)
         value = self.critic(h)
         return dist, value, attn_weights
+
+
+class TrBase(nn.Module):
+    def __init__(self, cfg, num_outputs):
+        super().__init__()
+        self.cfg = cfg
+        # memory is needed by inference
+        self.memory = [Memory(cfg.window_size, cfg.device) for _ in range(cfg.num_blocks)]
+
+        self.feature = nn.Sequential(OrderedDict([
+            ('conv1', layer_init(SeqConv2d(in_channels=1, out_channels=16, kernel_size=8, stride=4, padding=0))),
+            ('act1', nn.ReLU()),
+            ('conv2', layer_init(SeqConv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2, padding=0))),
+            ('act2', nn.ReLU()),
+            ('conv3', layer_init(SeqConv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=0))),
+            ('act3', nn.ReLU()),
+            ('flatten', nn.Flatten(start_dim=2)),
+            ('linear', nn.Linear(in_features=32 * 7 * 7, out_features=cfg.dim_input)),
+            ('act', nn.ReLU()),
+        ]))
+        # prevent "dying ReLU" output zero
+        nn.init.orthogonal_(self.feature.linear.weight, np.sqrt(2))
+
+        assert cfg.num_blocks > 0
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(cfg)
+            for _ in range(cfg.num_blocks)])
+
+    def clear_memory(self):
+        for m in self.memory:
+            m.clear()
+
+    # mode: inference/train
+    def forward(self, h, query_mask=None, key_mask=None, is_train=False):
+        mode = 'train' if is_train else 'inference'
+        attn_weights = []
+        for i, block in enumerate(self.transformer_blocks):
+            if mode == 'inference':
+                mem_kv = self.memory[i].get()
+                mask_size = h.shape[-2] if self.memory[i].is_empty() else (mem_kv.shape[-2] + h.shape[-2])
+                h, attn_weight, mem_kv = block(h, mem_kv, query_mask, key_mask[:, -mask_size:], mode)
+                self.memory[i].set(mem_kv.detach())
+            else:
+                h, attn_weight, _ = block(h, self.memory[i].get_empty_mem(), mode=mode)
+            attn_weights.append(attn_weight)
+        return h, attn_weights
+
+
+class TrModel(TrBase):
+    def __init__(self, cfg, num_outputs):
+        super().__init__(cfg, num_outputs)
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(in_features=cfg.dim_input, out_features=num_outputs), std=0.01),
+        )
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(in_features=cfg.dim_input, out_features=1), std=1),
+        )
+
+    def forward(self, x, query_mask=None, key_mask=None, is_train=False, lookback=0):
+        h = self.feature(x)
+        h, attn_weights = super().forward(h, query_mask, key_mask, is_train=is_train)
+        if is_train:
+            h = h[:, lookback:, ...]
+
+        logits = self.actor(h)
+        value = self.critic(h)
+        value = scaled_sigmoid(value)
+        return logits, value, attn_weights
 
 
 class SeqConv2d(nn.Conv2d):
@@ -272,13 +341,13 @@ class DTModel(TransformerCNNModel):
 
 
 class Memory:
-    def __init__(self, size):
+    def __init__(self, size, device):
         self.size = size
+        self.device = device
         self.mem = self.get_empty_mem()
 
-    @staticmethod
-    def get_empty_mem():
-        return torch.tensor([]).to(cfg.device)
+    def get_empty_mem(self):
+        return torch.tensor([]).to(self.device)
 
     def get(self):
         return self.mem

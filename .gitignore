@@ -5,6 +5,8 @@ data
 logs
 samples
 *.pth
+*.png
+*.jpg
 .DS_Store
 .idea
 .vscode

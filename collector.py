@@ -1,5 +1,6 @@
 import random
 import numpy as np
+import torch
 from utils import normalize, lookback_mask
 
 
@@ -36,8 +37,9 @@ class StepCollector:
 
 
 class MultiStepCollector(Collector):
-    def __init__(self, buf_len, lookback=0, lookforward=0):
+    def __init__(self, buf_len, n, lookback=0, lookforward=0):
         self.buf_len = buf_len
+        self.n = n
         self.lookback = lookback
         self.lookforward = lookforward
         self.step_collectors = None
@@ -68,21 +70,22 @@ class MultiStepCollector(Collector):
     def clear_all(self):
         pass
 
-    def peek_batch(self, index, seq_len, padding=0):
+    def peek_batch(self, index, seq_len, padding=None):
         if self.step_collectors is None:
-            return [padding] * seq_len
+            return [] if padding is None else [padding] * seq_len
         assert index < len(self.step_collectors)
         seq_data = self.step_collectors[index].peek(seq_len)
         d = seq_len - len(seq_data)
-        if d > 0:
+        if padding is not None and d > 0:
             seq_data = [padding] * d + seq_data
-        assert len(seq_data) == seq_len
+            assert len(seq_data) == seq_len
         return seq_data
 
     def peek_and_append(self, index, seq_len, elem, padding):
         seq = self.peek_batch(index, seq_len - 1, padding)
         seq.append(elem)
-        assert len(seq) == seq_len
+        if padding is not None:
+            assert len(seq) == seq_len
         return np.array(seq).swapaxes(1, 0)
 
     def peek_state(self, seq_len, state):
@@ -98,6 +101,16 @@ class MultiStepCollector(Collector):
         return sq_states
 
 
+class TrMultiStepCollector(MultiStepCollector):
+    def peek_state(self, seq_len, state):
+        sq_states = self.peek_and_append(self.StateIndex, seq_len, state, None)
+        return sq_states
+
+    def peek_mask(self, seq_len):
+        # some episode may not collect enough data
+        seq_done = self.peek_and_append(self.DoneIndex, seq_len, np.zeros((self.n,), dtype=np.int32), None)
+        mask = lookback_mask(seq_done.swapaxes(0, 1)).swapaxes(0, 1)
+        return mask
 
 
 
@@ -427,8 +440,124 @@ class StateSqDataGenerator(SqDataGenerator):
         assert len(new_states_seq) == len(dones_seq) - offset
 
         # new list, do not modify seq_data
-        data = [new_states_seq] + [d[offset:] for d in seq_data[1:]]
+        data = [new_states_seq] + [d[offset:] for d in seq_data[Collector.StateIndex+1:]]
         super().__init__(data, batch_size, data_fn, random)
+
+
+class LookBackBatchChunkDataGenerator(BaseGenerator):
+    """_summary_
+
+    Args:
+        batch_size: how many steps of data
+        lookback: window size
+        offset: where first data starting from
+        data: [batch_state1, batch_state2, ..., batch_state256], [batch_action1, batch_action2, ..., batch_action256], ...
+    """
+    def __init__(self, batch_size, lookback, offset, data_fn, *data):
+        super().__init__(batch_size, data_fn, False, *data)
+        self.lookback = lookback
+        self.offset = offset
+
+    def get_dynamic_offset(self):
+        return self.offset
+
+    def next_batch(self):
+        for i in range(self.offset, len(self), self.batch_size):
+            self.offset = min(i, self.lookback)
+            yield self.data_fn(*[d[i - self.offset:i + self.batch_size] for d in self.data])
+            self.inc_iter()            
+
+
+class LookBackBatchSeqDataGenerator(LookBackBatchChunkDataGenerator):
+    def __len__(self):
+        if len(self.data) > 0:
+            l_seq = len(self.data[0]) - self.offset
+            l_batch = self.data[0][0].shape[0]
+            return l_seq * l_batch
+        else:
+            return 0
+
+    def next_batch(self):
+        sq_states = self.data[Collector.StateIndex]
+        sq_dones = self.data[Collector.DoneIndex]
+        for i in range(self.offset, len(sq_states), self.batch_size):
+            self.offset = min(i, self.lookback)
+            start = i - self.offset
+            end = i + self.batch_size
+
+            seq_list = self.parse_seqs(sq_states[start:end], sq_dones[start:end], self.offset, self.lookback)
+            states, masks, locs = zip(*seq_list)
+            self.loc_mapping = locs
+            states = np.array(states)
+            masks = np.array(masks)
+
+            batch = [np.array(d[i:end]).swapaxes(0, 1) for d in self.data[Collector.StateIndex+1:]]
+            batch = [states] + batch + [masks]
+            yield self.data_fn(*batch)
+            self.inc_iter()
+
+    def parse_seqs(self, sq_states, sq_dones, sq_offset, lookback):
+        ret = []
+        for j in range(sq_dones[0].shape[0]):
+            offset = sq_offset
+            states, dones = [s[j] for s in sq_states], [d[j] for d in sq_dones]
+            dones[-1] = dones[-1] - dones[-1] + 1
+            start = 0
+            for k in range(offset, len(dones)):
+                if dones[k]:
+                    end = k + 1
+                    t_states = states[start:end]
+                    t_dones = dones[start:end]
+
+                    n_pad = lookback - offset
+                    assert n_pad >= 0
+                    if n_pad > 0:
+                        t_states = [t_states[0] - t_states[0]] * n_pad + t_states
+                        t_dones = [t_dones[0] - t_dones[0] + 1] * n_pad + t_dones
+
+                    t_mask = list(lookback_mask(np.array(t_dones)))
+                    t_loc_mapping = [j, start + offset, end]
+                    ret.append([t_states, t_mask, t_loc_mapping])
+
+                    offset = min(end, lookback)
+                    start = end - offset
+        self.pad_seqs(ret)
+        return ret
+
+    def pad_seqs(self, seqs):
+        max_len = max([len(seq) for seq, _, _ in seqs])
+        for seq, mask, loc in seqs:
+            if len(seq) < max_len:
+                n_pad = max_len - len(seq)
+                seq.extend([seq[0] - seq[0]] * n_pad)
+                mask.extend([mask[0] - mask[0]] * n_pad)
+            #     loc.append(max_len - n_pad)
+            # else:
+            #     loc.append(max_len)
+
+    # tensor: (seq, batch, ...)
+    def trans_back_single(self, shape, offset, loc_mapping, tensor):
+        assert tensor.shape[0] == len(loc_mapping)
+        trans = torch.zeros(shape + tensor.shape[2:], dtype=tensor.dtype, device=tensor.device)
+        for i, (j, start, end) in enumerate(loc_mapping):
+            # strip offset
+            trans[j, start-offset:end-offset] = tensor[i, :end-start]
+        return trans
+
+    def trans_back(self, *tensors):
+        trans = []
+        b = self.loc_mapping[-1][0] + 1
+        max_end = max([end for j, start, end in self.loc_mapping])
+        min_start = min([start for j, start, end in self.loc_mapping])
+        l = max_end - min_start
+        for tensor in tensors:
+            t = self.trans_back_single((b, l), min_start, self.loc_mapping, tensor)
+            trans.append(t)
+        return trans
+
+
+
+
 
 
 def test_StateSeqEpDataGenerator():
@@ -566,11 +695,70 @@ def test_StateSqDataGenerator():
     assert np.all(np.array(g.data[2]) == np.stack([np.arange(6,11), np.arange(16, 21)], 1).reshape(-1))
 
 
+def test_LookBackBatchSeqDataGenerator():
+    seq = [
+        torch.arange(20).reshape(10,2) + 1,
+        torch.arange(20).reshape(10,2) + 1,
+        torch.arange(20).reshape(10,2) + 1,
+        torch.tensor([[False, False, True, False, False, True, False, False, False, True],
+                      [False, False, True, False, False, True, False, False, False, True]], dtype=torch.float32).T,
+    ]
+    batch_size, lookback, offset = 5, 3, 0
+    g = LookBackBatchSeqDataGenerator(batch_size, lookback, offset, data_fn, *seq)
+    iter = g.next_batch()
+    v = next(iter)
+    assert torch.all(v[0] == torch.tensor([[ 0.,  0.,  0.,  1.,  3.,  5.],
+        [ 1.,  3.,  5.,  7.,  9.,  0.],
+        [ 0.,  0.,  0.,  2.,  4.,  6.],
+        [ 2.,  4.,  6.,  8., 10.,  0.]]))
+    assert torch.all(v[-1] == torch.tensor([[0., 0., 0., 1., 1., 1.],
+        [0., 0., 0., 1., 1., 0.],
+        [0., 0., 0., 1., 1., 1.],
+        [0., 0., 0., 1., 1., 0.]]))
+    assert torch.all(g.trans_back(v[0][:, lookback:])[0] == v[1])
+
+    v = next(iter)
+    assert torch.all(v[0] == torch.tensor([[ 5.,  7.,  9., 11.,  0.,  0.,  0.],
+        [ 7.,  9., 11., 13., 15., 17., 19.],
+        [ 6.,  8., 10., 12.,  0.,  0.,  0.],
+        [ 8., 10., 12., 14., 16., 18., 20.]]))
+    assert torch.all(v[-1] == torch.tensor([[0., 1., 1., 1., 0., 0., 0.],
+        [0., 0., 0., 1., 1., 1., 1.],
+        [0., 1., 1., 1., 0., 0., 0.],
+        [0., 0., 0., 1., 1., 1., 1.]]))
+    assert torch.all(g.trans_back(v[0][:, lookback:])[0] == v[1])
+
+    batch_size, lookback, offset = 5, 3, 2
+    g = LookBackBatchSeqDataGenerator(batch_size, lookback, offset, data_fn, *seq)
+    iter = g.next_batch()
+    v = next(iter)
+    assert torch.all(v[0] == torch.tensor([[ 0.,  1.,  3.,  5.,  0.,  0.],
+        [ 1.,  3.,  5.,  7.,  9., 11.],
+        [ 7.,  9., 11., 13.,  0.,  0.],
+        [ 0.,  2.,  4.,  6.,  0.,  0.],
+        [ 2.,  4.,  6.,  8., 10., 12.],
+        [ 8., 10., 12., 14.,  0.,  0.]]))
+    assert torch.all(v[-1] == torch.tensor([[0., 1., 1., 1., 0., 0.],
+        [0., 0., 0., 1., 1., 1.],
+        [0., 0., 0., 1., 0., 0.],
+        [0., 1., 1., 1., 0., 0.],
+        [0., 0., 0., 1., 1., 1.],
+        [0., 0., 0., 1., 0., 0.]]))
+    assert torch.all(g.trans_back(v[0][:, lookback:])[0] == v[1])
+
+    v = next(iter)
+    assert torch.all(v[0] == torch.tensor([[ 9., 11., 13., 15., 17., 19.],
+        [10., 12., 14., 16., 18., 20.]]))
+    assert torch.all(v[-1] == torch.tensor([[0., 0., 1., 1., 1., 1.],
+        [0., 0., 1., 1., 1., 1.]]))
+    assert torch.all(g.trans_back(v[0][:, lookback:])[0] == v[1])
+
+
 if __name__ == '__main__':
     import torch
     from ppo_seq import cfg
 
-    def data_fn(self, states, actions, rewards, *extra):
+    def data_fn(states, actions, rewards, *extra):
         states = torch.as_tensor(np.array(states), dtype=torch.float32).to(cfg.device)  # requires_grad=False
         actions = torch.as_tensor(actions).to(cfg.device)  # requires_grad=False
         rewards = torch.as_tensor(rewards).to(cfg.device)  # requires_grad=False
@@ -581,3 +769,4 @@ if __name__ == '__main__':
     test_LookBackSeqDataGenerator()
     test_MyLocalAttention()
     test_StateSqDataGenerator()
+    test_LookBackBatchSeqDataGenerator()

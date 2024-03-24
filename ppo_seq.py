@@ -20,8 +20,8 @@ from stable_baselines3.common.atari_wrappers import (
 
 
 config = {
-    'model_net': 'cnn',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'ppo.seq.cnn.good.scaled_sigmoid',
+    'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
+    'model': 'ppo.seq.transformer.good',
     'model_dir': 'models',
     'env_id_list': ['Breakout-v5'] * 8,
     'envpool': True,
@@ -50,21 +50,22 @@ config = {
     'max_batch_size': 1000,  # mlp 10w, cnn 3w, cnn3d 3k, transformer 1k
     'chunk_percent': 1/8,  # split into chunks, do optimise per chunk
     'chunk_size': None,
-    'seq_len': 11,
+    'seq_len': 65,
     'epoch_size': 256,
     'epoch_episodes': 8,
-    'epoch_save': 300,
-    'max_epoch': 8000,
+    'epoch_save': 900,
+    'max_epoch': 30000,
+    'max_episode_steps': 8000,
     'target_reward': 20000000,
     'diff_state': False,
     'shuffle': True,
 
     'transformer': {
         'num_blocks': 1,
-        'dim_input': 128,  # dim_head * num_heads
-        'dim_head': 16,
+        'dim_input': 256,  # dim_head * num_heads
+        'dim_head': 32,
         'num_heads': 8,
-        'state_dim': 80 * 80,
+        'state_dim': 84 * 84,
         'action_dim': 6,
         'reward_dim': 1,
         # 'window_size': 256,  # seq_len - 1
@@ -74,10 +75,14 @@ config = {
     },
 }
 cfg = Config(**config)
+cfg.transformer.device = cfg.device
 cfg.transformer.window_size = cfg.seq_len - 1
-env_ = gym.make(cfg.env_id_list[0])
-cfg.n_actions = cfg.transformer.action_dim = env_.action_space.n
-del env_
+# cfg.n_actions = cfg.transformer.action_dim = 4 # env_.action_space.n
+
+
+
+def set_action_dim(env):
+    cfg.n_actions = cfg.transformer.action_dim = env.action_space.n
 
 
 def discount_gae(rewards, dones, values, next_value, gamma=0.99, lam=0.95):
@@ -95,18 +100,9 @@ def discount_gae(rewards, dones, values, next_value, gamma=0.99, lam=0.95):
     return returns
 
 
-def loss_ppo(trainer, data_loader, states, actions, old_log_probs, old_values, rewards, advantages):
-    if cfg.model_net in ('transformer', 'transformercnn'):
-        lookback = data_loader.get_dynamic_offset()
-        dist, values, attn_weights = trainer.model(states.unsqueeze(0), mode='train', lookback=lookback)
-        states, actions, rewards, old_log_probs, advantages = states[lookback:], actions[lookback:], rewards[lookback:], old_log_probs[lookback:], advantages[lookback:]
-        if data_loader.get_iter() == 0:
-            trainer.writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weights])
-    else:
-        dist, values = trainer.model(states)
-    log_probs = dist.log_prob(actions)
-    entropy = dist.entropy()
-    values = values.squeeze(1)
+def loss_ppo(trainer, data_loader, states, actions, dones, old_log_probs, old_values, rewards, advantages, *extra):
+    params = trainer.get_model_params(data_loader, states, *extra, is_train=True)
+    _, log_probs, values, entropy = trainer.predict(*params, actions, is_train=True)
 
     # todo: normalize?
     # advantages = rewards - values.detach()
@@ -144,6 +140,13 @@ class Train:
         return state if not cfg.diff_state else (state - last_state)
 
     @staticmethod
+    def get_stack_frame_num():
+        if cfg.model_net.startswith('transformer') or cfg.model_net.startswith('cnn3d'):
+            return 1
+        else:
+            return 4
+
+    @staticmethod
     def make_env_fn(env_id, seed=None, is_train=True, **kwargs):
         if cfg.envpool:
             def _init():
@@ -152,8 +155,10 @@ class Train:
                     cfg.env_id_list[0],
                     env_type="gymnasium",
                     num_envs=1,
+                    max_episode_steps=cfg.max_episode_steps,
                     episodic_life=is_train,
                     reward_clip=is_train,
+                    stack_num=Train.get_stack_frame_num(),
                     seed=seed if seed is not None else np.random.randint(0, 10000),
                 )
                 env = EnvPoolWrapper(env)
@@ -161,7 +166,7 @@ class Train:
             return _init
         else:
             def _init():
-                env = gym.make(env_id, **kwargs)
+                env = gym.make(env_id, max_episode_steps=cfg.max_episode_steps, **kwargs)
                 n_actions = env.action_space.n
                 if env_id.startswith('MsPacman'):
                     n_actions = 5
@@ -175,7 +180,7 @@ class Train:
                 env = gym.wrappers.ResizeObservation(env, (84, 84))
                 env = gym.wrappers.GrayScaleObservation(env)
                 env = NormObsWrapper(env)
-                env = NPFrameStack(env, 4)
+                env = NPFrameStack(env, Train.get_stack_frame_num())
                 env.seed(seed)  # Apply a unique seed to each environment
                 return env
             return _init
@@ -188,8 +193,10 @@ class Train:
                 cfg.env_id_list[0],
                 env_type="gymnasium",
                 num_envs=len(cfg.env_id_list),
+                max_episode_steps=cfg.max_episode_steps,
                 episodic_life=is_train,
                 reward_clip=is_train,
+                stack_num=Train.get_stack_frame_num(),
                 seed=np.random.randint(0, 10000),
             )
             envs = EnvPoolWrapper(envs)
@@ -219,7 +226,7 @@ class Train:
         elif cfg.model_net == 'cnn3d2d':
             return CNN3d2dModel(cfg, num_outputs)
         elif cfg.model_net == 'transformer':
-            return TransformerModel(cfg.transformer, num_outputs)
+            return TrModel(cfg.transformer, num_outputs)
         elif cfg.model_net == 'transformercnn':
             return TransformerCNNModel(cfg.transformer, num_outputs)
         elif cfg.model_net == 'dt':
@@ -277,15 +284,23 @@ class Train:
     def train_eval(self):
         return self.avg_reward
 
-    def get_model_params(self, collector, state):
-        # return tuple
-        return torch.FloatTensor(state).to(cfg.device),
+    def get_model_params(self, collector, state, *_, is_train=False):
+        if is_train:
+            return state,
+        else:
+            # return tuple
+            return torch.FloatTensor(state).to(cfg.device),
 
-    def predict_action(self, dist, value):
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+    def predict(self, state, action=None, is_train=False):
+        dist, value = self.model(state)
         value = value.squeeze(1)
-        return action.detach().cpu().numpy().astype(np.int32), log_prob.detach().cpu().numpy(), value.detach().cpu().numpy()
+        if is_train:
+            log_prob = dist.log_prob(action)
+            return action, log_prob, value, dist.entropy()
+        else:
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            return action.detach().cpu().numpy().astype(np.int32), log_prob.detach().cpu().numpy(), value.detach().cpu().numpy()
 
     # episodes: [(states, actions, rewards, ...), ...]
     def process_episodes(self, episodes):
@@ -351,14 +366,14 @@ class Train:
         ep_advantages = ep_discount_rewards - ep_values
         episode.insert(len(episode), list(ep_advantages))
 
-    def loss(self, data_loader, states, actions, old_log_probs, old_values, rewards, advantages):
-        return loss_ppo(self, data_loader, states, actions, old_log_probs, old_values, rewards, advantages)
+    def loss(self, data_loader, states, actions, dones, old_log_probs, old_values, rewards, advantages, *extra):
+        return loss_ppo(self, data_loader, states, actions, dones, old_log_probs, old_values, rewards, advantages, *extra)
 
     def optimise_by_minibatch(self, model, optimizer, data_loader):
         acc_loss = {}
         optimizer.zero_grad()
         for states, actions, rewards, dones, *extra in data_loader.next_batch():
-            loss_dict = self.loss(data_loader, states, actions, *extra)
+            loss_dict = self.loss(data_loader, states, actions, dones, *extra)
 
             # summary in the first iteration and zero_grad after that
             if data_loader.get_iter() == 0:
@@ -383,6 +398,7 @@ class Train:
             writer.summary_text('', f'```python\n{In[-1]}\n```')
 
         envs = self.make_envs()
+        set_action_dim(envs)
         num_outputs = cfg.n_actions # = cfg.transformer.action_dim = envs.action_space.n
 
         model = self.model = self.get_model(cfg, num_outputs).to(cfg.device)
@@ -404,7 +420,7 @@ class Train:
 
             with torch.no_grad():
                 params = self.get_model_params(collector, state_)
-                action, *extra = self.predict_action(*model(*params))
+                action, *extra = self.predict(*params)
 
             # action = action.cpu().numpy()
             next_state, reward, done, info = envs.step(action)
@@ -475,7 +491,7 @@ class Train:
             # state_ = state_[np.newaxis, ...]
 
             params = self.get_model_params(collector, state_)
-            action, *extra = self.predict_action(*model(*params))
+            action, *extra = self.predict(*params)
 
             next_state, reward, done, _ = env.step(action)
             # next_state = grey_crop_resize(next_state, env.spec.id)
@@ -487,6 +503,7 @@ class Train:
             total_reward += reward[0]
             steps += 1
         collector.clear_all()
+        self.end_epoch_optimize(0, env)
         return total_reward, steps
 
     def eval(self, load_from=None):
@@ -494,6 +511,7 @@ class Train:
 
         env_test = self.make_test_env(render_mode='human')
         # num_outputs = env_test.action_space.n
+        set_action_dim(env_test)
         num_outputs = cfg.n_actions # = cfg.transformer.action_dim = env_test.action_space.n
         model = self.get_model(cfg, num_outputs).to(cfg.device)
         model.eval()
@@ -517,7 +535,7 @@ class SeqTrain(Train):
     def process_episodes(self, seq_data):
         with torch.no_grad():
             params = self.get_model_params(self.collector, self.collector.next_state)
-            next_action, next_log_prob, next_value = self.predict_action(*self.model(*params))
+            next_action, next_log_prob, next_value, *_ = self.predict(*params)
 
         self.update_1_env(seq_data)
         del seq_data[6:]
@@ -535,29 +553,6 @@ class SeqTrain(Train):
 
         total_samples = len(sq_states) * len(sq_states[0])
         return total_samples
-
-    # def update_1_env(self, seq_data):
-    #     offset = len(seq_data[0]) - cfg.epoch_size
-    #     seq_data = [d[offset:] for d in seq_data]
-
-    #     if not hasattr(self, 'total_runs_1_env'):
-    #         self.total_runs_1_env = 0
-    #         self.steps_1_env = 0
-    #         self.total_reward_1_env = 0
-
-    #     rewards = seq_data[self.collector.RewardIndex]
-    #     dones = seq_data[self.collector.DoneIndex]
-    #     infos = seq_data[-1]
-    #     for info in infos:
-    #         self.total_reward_1_env += info[0]['reward']
-    #         self.steps_1_env += 1
-    #         if info[0]['terminated']:
-    #             self.total_runs_1_env += 1
-    #             print(f'Epoch {self.writer.global_step} Run {self.total_runs_1_env}, steps {self.steps_1_env}, Reward {self.total_reward_1_env}')
-    #             self.writer.add_scalar('Reward/env_1_reward', self.total_reward_1_env, self.writer.global_step)
-    #             self.writer.add_scalar('Reward/env_1_step', self.steps_1_env, self.writer.global_step)
-    #             self.total_reward_1_env = 0
-    #             self.steps_1_env = 0
 
     def update_1_env(self, seq_data):
         offset = len(seq_data[0]) - cfg.epoch_size
@@ -585,7 +580,7 @@ class SeqTrain(Train):
             self.total_rewards *= (1 - term)
 
     def get_data_collector(self):
-        return MultiStepCollector(cfg.epoch_size)
+        return MultiStepCollector(cfg.epoch_size, len(cfg.env_id_list))
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
         return SqDataGenerator(seq_data, chunk_size, data_fn, random)
@@ -609,12 +604,15 @@ class SeqTrain(Train):
 
 class SeqTrainCNN3d(SeqTrain):
     def get_data_collector(self):
-        return MultiStepCollector(cfg.epoch_size, lookback=cfg.seq_len - 1)
+        return MultiStepCollector(cfg.epoch_size, len(cfg.env_id_list), lookback=cfg.seq_len - 1)
 
-    def get_model_params(self, collector, state):
-        state_ = collector.peek_state(cfg.seq_len, state)
-        # return tuple
-        return torch.FloatTensor(state_).to(cfg.device),
+    def get_model_params(self, collector, state, *_, is_train=False):
+        if is_train:
+            return state,
+        else:
+            state_ = collector.peek_state(cfg.seq_len, state)
+            # return tuple
+            return torch.FloatTensor(state_).to(cfg.device),
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
         lookback = cfg.seq_len - 1
@@ -622,11 +620,85 @@ class SeqTrainCNN3d(SeqTrain):
         return StateSqDataGenerator(seq_data, chunk_size, lookback, offset, data_fn, random)
 
 
+class SeqTrainTransformer(SeqTrain):
+    def process_episodes(self, seq_data):
+        infos = seq_data[-1]
+        terminated = [info['terminated'] for info in infos]
+        ret = super().process_episodes(seq_data)
+        # replace with real terminated after super's process_episodes (need to calc advantage)
+        seq_data[Collector.DoneIndex] = terminated
+        return ret
+
+    def get_data_collector(self):
+        return TrMultiStepCollector(cfg.epoch_size, len(cfg.env_id_list), lookback=cfg.transformer.window_size)
+
+    def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
+        offset = len(seq_data[0]) - cfg.epoch_size
+        return LookBackBatchChunkDataGenerator(chunk_size, cfg.transformer.window_size, offset, data_fn, *seq_data)
+
+    def get_minibatch_loader(self, chunk_loader, max_batch_size, data_fn, random, *chunk):
+        return LookBackBatchSeqDataGenerator(max_batch_size, cfg.transformer.window_size, chunk_loader.get_dynamic_offset(), data_fn, *chunk)
+
+    def data_fn(self, *data):
+        ret = super().data_fn(*data[:-1])
+        mask = torch.as_tensor(np.array(data[-1]), dtype=torch.bool).to(cfg.device)  # requires_grad=False
+        return ret + (mask,)
+
+    def get_model_params(self, collector, state, mask=None, is_train=False):
+        if is_train:
+            data_loader = collector
+            # lookback = data_loader.get_dynamic_offset()
+            lookback = cfg.transformer.window_size
+            query_mask = mask
+            key_mask = mask
+            return state, query_mask, key_mask, lookback, data_loader.get_iter(), data_loader
+        else:
+            state_ = state
+            mask = collector.peek_mask(cfg.seq_len)
+            pt_state = torch.as_tensor(state_, dtype=torch.float32).unsqueeze(1).to(cfg.device)
+            pt_query_mask = None
+            pt_key_mask = torch.as_tensor(mask, dtype=torch.bool).to(cfg.device)
+            return pt_state, pt_query_mask, pt_key_mask
+
+    def predict(self, state, query_mask, key_mask, lookback=0, n_iter=0, data_loader=None, action=None, is_train=False):
+        if is_train:
+            logits, value, attn_weight = self.model(state, query_mask, key_mask, is_train=is_train, lookback=lookback)
+            if n_iter == 0:
+                self.writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weight])
+
+            state = state[:, lookback:]
+            state, value, logits = data_loader.trans_back(state, value, logits)
+            dist = Categorical(logits=logits)
+            log_prob = dist.log_prob(action)
+            entropy = dist.entropy()
+        else:
+            logits, value, attn_weight = self.model(state, query_mask, key_mask, is_train=is_train, lookback=lookback)
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            action, log_prob, value = action.squeeze(-1), log_prob.squeeze(-1), value.squeeze(-1)
+
+        value = value.squeeze(-1)
+        if is_train:
+            return action, log_prob, value, entropy
+        else:
+            return action.detach().cpu().numpy().astype(np.int32), log_prob.detach().cpu().numpy(), value.detach().cpu().numpy()
+
+    def begin_epoch_optimize(self, epoch):
+        super().begin_epoch_optimize(epoch)
+        self.model.clear_memory()
+
+    def end_epoch_optimize(self, epoch, envs):
+        ret = super().end_epoch_optimize(epoch, envs)
+        self.model.clear_memory()
+        return ret
+
+
 def get_trainer():
     if cfg.model_net in ('cnn3d', 'cnn3d2d'):
         return SeqTrainCNN3d()
-    # elif cfg.model_net in ('transformer', 'transformercnn'):
-    #     return TrainTransformer()
+    elif cfg.model_net in ('transformer', 'transformercnn'):
+        return SeqTrainTransformer()
     # elif cfg.model_net == 'dt':
     #     return TrainDT()
     else:
