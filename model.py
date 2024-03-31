@@ -6,7 +6,7 @@ from torch.distributions import Categorical
 from einops import rearrange, repeat
 from local_attention import LocalAttention
 from local_attention.rotary import apply_rotary_pos_emb
-from utils import Config
+from utils import Config, lookforward_step_indices
 
 
 class MyLocalAttention(LocalAttention):
@@ -540,11 +540,11 @@ class CNNModel2(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.feature = nn.Sequential(OrderedDict([
-            ('conv1', layer_init(nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding=0))),
+            ('conv1', layer_init(nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding=0))),  # 20x20
             ('act1', nn.ReLU()),
-            ('conv2', layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0))),
+            ('conv2', layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0))),  # 9x9
             ('act2', nn.ReLU()),
-            ('conv3', layer_init(nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0))),
+            ('conv3', layer_init(nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0))),  # 7x7
             ('act3', nn.ReLU()),
             ('flatten', nn.Flatten()),
             ('linear', nn.Linear(in_features=64 * 7 * 7, out_features=cfg.hidden_dim)),
@@ -566,6 +566,35 @@ class CNNModel2(nn.Module):
         return dist, value
 
 
+class LFCNNModel2(CNNModel2):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__(cfg, num_outputs)
+        self.up_feature = layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=64 * 7 * 7))
+
+        n_up = len(lookforward_step_indices(cfg.lookforward))
+        self.up_states = nn.ModuleList([
+            nn.Sequential(OrderedDict([
+                ('flatten', nn.Unflatten(1, (64, 7, 7))),
+                ('act1', nn.ReLU()),
+                ('upconv1', layer_init(nn.ConvTranspose2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0))),
+                ('act2', nn.ReLU()),
+                ('upconv2', layer_init(nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=4, stride=2, padding=0))),
+                ('act3', nn.ReLU()),            
+                ('upconv3', layer_init(nn.ConvTranspose2d(in_channels=32, out_channels=4, kernel_size=8, stride=4, padding=0))),
+            ])) for _ in range(n_up)
+        ])
+
+    def forward(self, x: torch.Tensor):
+        feature = self.feature(x)
+        logits = self.actor(feature)
+        dist = Categorical(logits=logits)
+        value = self.critic(feature)
+        value = scaled_sigmoid(value)
+        up_feature = self.up_feature(feature)
+        up_states = []
+        for up in self.up_states:
+            up_states.append(up(up_feature))
+        return dist, value, *up_states
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):

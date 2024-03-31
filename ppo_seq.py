@@ -20,8 +20,8 @@ from stable_baselines3.common.atari_wrappers import (
 
 
 config = {
-    'model_net': 'transformer',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'ppo.seq.transformer.good',
+    'model_net': 'cnn_lf',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
+    'model': 'ppo.seq.cnn.lookforward',
     'model_dir': 'models',
     'env_id_list': ['Breakout-v5'] * 8,
     'envpool': True,
@@ -30,7 +30,7 @@ config = {
     # 'env_id_list': ['PongNoFrameskip-v4', 'BreakoutNoFrameskip-v4', 'SpaceInvadersNoFrameskip-v4', 'MsPacmanNoFrameskip-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'ppo.seq.cnn.good',
+    # 'wandb': 'ppo.seq.cnn.lookforward',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
@@ -39,6 +39,7 @@ config = {
     'hidden_dim': 512,  # hidden size, linear units of the output layer
     'c_critic': 1.0,  # critic coefficient
     'c_entropy': 0.01,  # entropy coefficient
+    'c_pred_states': 0.05,
     'gamma': 0.99,
     'lam': 0.95,
     'surr_clip': 0.2,
@@ -51,10 +52,11 @@ config = {
     'chunk_percent': 1/8,  # split into chunks, do optimise per chunk
     'chunk_size': None,
     'seq_len': 65,
+    'lookforward': 8,
     'epoch_size': 256,
     'epoch_episodes': 8,
-    'epoch_save': 900,
-    'max_epoch': 30000,
+    'epoch_save': 300,
+    'max_epoch': 20000,
     'max_episode_steps': 8000,
     'target_reward': 20000000,
     'diff_state': False,
@@ -221,6 +223,8 @@ class Train:
             return MLPModel(cfg, num_outputs)
         elif cfg.model_net == 'cnn':
             return CNNModel2(cfg, num_outputs)
+        elif cfg.model_net == 'cnn_lf':
+            return LFCNNModel2(cfg, num_outputs)
         elif cfg.model_net == 'cnn3d':
             return CNN3dModel2(cfg, num_outputs)
         elif cfg.model_net == 'cnn3d2d':
@@ -394,6 +398,8 @@ class Train:
         writer = self.writer
         if not cfg.run_in_notebook:
             writer.summary_script_content(__file__)
+            writer.summary_script_content('model.py')
+            writer.summary_script_content('collector.py')
         else:
             writer.summary_text('', f'```python\n{In[-1]}\n```')
 
@@ -513,7 +519,7 @@ class Train:
         # num_outputs = env_test.action_space.n
         set_action_dim(env_test)
         num_outputs = cfg.n_actions # = cfg.transformer.action_dim = env_test.action_space.n
-        model = self.get_model(cfg, num_outputs).to(cfg.device)
+        model = self.model = self.get_model(cfg, num_outputs).to(cfg.device)
         model.eval()
 
         self.load_model(load_from, model, None)
@@ -600,6 +606,61 @@ class SeqTrain(Train):
             reward, steps = self.test_env(self.env_test, self.model)
             avg_reward += reward
         return avg_reward / episodes
+
+
+# lookforward
+class LFSeqTrain(SeqTrain):
+    def get_data_collector(self):
+        return MultiStepCollector(cfg.epoch_size, len(cfg.env_id_list), lookforward=cfg.lookforward)
+
+    def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
+        return LFSqDataGenerator(seq_data, chunk_size, data_fn, random, cfg.lookforward)
+
+    def data_fn(self, states, actions, rewards, *extra):
+        n_lf_states = len(lookforward_step_indices(cfg.lookforward))
+        return super().data_fn(states, actions, rewards, *extra[:-n_lf_states], *[np.array(d) for d in extra[-n_lf_states:]])
+
+    def predict(self, state, action=None, is_train=False):
+        dist, value, *up_states = self.model(state)
+        value = value.squeeze(1)
+        if is_train:
+            log_prob = dist.log_prob(action)
+            return action, log_prob, value, dist.entropy(), *up_states
+        else:
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            return action.detach().cpu().numpy().astype(np.int32), log_prob.detach().cpu().numpy(), value.detach().cpu().numpy()
+
+    def loss(self, data_loader, states, actions, dones, old_log_probs, old_values, rewards, advantages, *extra):
+        params = self.get_model_params(data_loader, states, *extra, is_train=True)
+        _, log_probs, values, entropy, *up_states = self.predict(*params, actions, is_train=True)
+
+        # todo: normalize?
+        # advantages = rewards - values.detach()
+        # no norm for transformer, will cause NaN
+        advantages = normalize(advantages)
+        ratio = (log_probs - old_log_probs).exp()
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
+        actor_loss = -torch.min(surr1, surr2).sum() / len(data_loader)
+
+        actor_clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().mean()
+        self.writer.stash_summary('Monitor', {'actor_clip_fracs': actor_clip_fracs}, weight=len(data_loader))
+
+        critic_loss = (values - rewards).pow(2)
+        if cfg.value_clip is not None:
+            critic_clip_fracs = ((values - old_values).abs() > cfg.value_clip).float().mean()
+            self.writer.stash_summary('Monitor', {'critic_clip_fracs': critic_clip_fracs}, weight=len(data_loader))
+
+        critic_loss = 0.5 * critic_loss.sum() / len(data_loader)
+        entropy_loss = -entropy.sum() / len(data_loader)
+
+        pred_states_loss = 0
+        for up_state, target_state in zip(up_states, extra):
+            pred_states_loss += 0.5 * (up_state - target_state).pow(2).mean(dim=(1,2,3)).sum() / len(data_loader)
+
+        loss = actor_loss + critic_loss * cfg.c_critic + entropy_loss * cfg.c_entropy + pred_states_loss * cfg.c_pred_states
+        return {'critic_loss': critic_loss, 'actor_loss': actor_loss, 'entropy_loss': entropy_loss, 'loss': loss, 'pred_states_loss': pred_states_loss}
 
 
 class SeqTrainCNN3d(SeqTrain):
@@ -697,6 +758,8 @@ class SeqTrainTransformer(SeqTrain):
 def get_trainer():
     if cfg.model_net in ('cnn3d', 'cnn3d2d'):
         return SeqTrainCNN3d()
+    if cfg.model_net in ('cnn_lf',):
+        return LFSeqTrain()
     elif cfg.model_net in ('transformer', 'transformercnn'):
         return SeqTrainTransformer()
     # elif cfg.model_net == 'dt':

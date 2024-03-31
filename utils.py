@@ -274,6 +274,15 @@ def lookback_mask(dones):
     return mask.copy()  # return copy to prevent reverse index error when converting torch tensor
 
 
+def lookforward_step_indices(lookforward):
+    seq = []
+    i = 1
+    while i <= lookforward:
+        seq.append(i)
+        i *= 2
+    return seq
+
+
 def wandb_login():
     import wandb
     from kaggle_secrets import UserSecretsClient

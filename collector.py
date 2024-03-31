@@ -1,7 +1,7 @@
 import random
 import numpy as np
 import torch
-from utils import normalize, lookback_mask
+from utils import normalize, lookback_mask, lookforward_step_indices
 
 
 class Collector:
@@ -16,20 +16,14 @@ class StepCollector:
         assert buf_len > 0
         self.buf_len = buf_len
         self.seq = []
-        self.count = 0
 
     def add(self, item):
         self.seq.append(item)
         self.seq = self.seq[-self.buf_len:]
-        self.count += 1
-
-    def steps_count(self):
-        return self.count
 
     def roll(self, lookback=0):
         ret = self.seq
         self.seq = ret[-lookback:] if lookback > 0 else []
-        self.count = 0
         return ret
 
     def peek(self, n):
@@ -43,29 +37,34 @@ class MultiStepCollector(Collector):
         self.lookback = lookback
         self.lookforward = lookforward
         self.step_collectors = None
+        self.count = 0
 
     # state, action, reward, done, next_state, *extra_pt_tensor
     def add(self, state, action, reward, done, next_state, *extra):
+        self.count += 1
         # prevent torch.as_tensor throwing warning for np.bool_ array
         items = (state, action, reward, done.astype(np.int32)) + extra
         self.next_state = next_state
         if self.step_collectors is None:
-            self.step_collectors = [StepCollector(self.buf_len + self.lookback) for _ in range(len(items))]
+            self.step_collectors = [StepCollector(self.buf_len + self.lookback + self.lookforward) for _ in range(len(items))]
         for i, item in enumerate(items):
             self.step_collectors[i].add(item)
 
     def has_full_batch(self, n_steps):
-        if self.step_collectors is None or len(self.step_collectors) == 0:
-            return False
-        curr_steps = self.step_collectors[0].steps_count()
-        assert curr_steps <= n_steps
-        return curr_steps == n_steps
+        # if self.step_collectors is None or len(self.step_collectors) == 0:
+        #     return False
+        curr_steps = self.count
+        target_steps = n_steps + self.lookforward
+        assert curr_steps <= target_steps
+        return curr_steps == target_steps
 
     def roll_batch(self):
-        return [seq.roll(self.lookback) for seq in self.step_collectors]
+        self.count = 0
+        return [seq.roll(self.lookback + self.lookforward) for seq in self.step_collectors]
 
-    def roll_batch_with_index(self):
-        return {i: seq.roll() for i, seq in enumerate(self.step_collectors)}
+    # def roll_batch_with_index(self):
+    #     self.count = 0
+    #     return {i: seq.roll() for i, seq in enumerate(self.step_collectors)}
 
     def clear_all(self):
         pass
@@ -412,6 +411,19 @@ class SqDataGenerator(EpDataGenerator):
     def __init__(self, seq_data, batch_size, data_fn, random=False):
         episodes = [*zip(*seq_data)]
         super().__init__(episodes, batch_size, data_fn, random)
+
+
+class LFSqDataGenerator(SqDataGenerator):
+    def __init__(self, seq_data, batch_size, data_fn, random=False, lookforward=0):
+        self.lookforward = lookforward
+        sq_states = seq_data[Collector.StateIndex]
+        length = len(sq_states) - lookforward
+        data = [d[:length] for d in seq_data]
+
+        indices = lookforward_step_indices(lookforward)
+        lf_states = [sq_states[i:i+length] for i in indices]
+        data.extend(lf_states)
+        super().__init__(data, batch_size, data_fn, random)
 
 
 class StateSqDataGenerator(SqDataGenerator):
