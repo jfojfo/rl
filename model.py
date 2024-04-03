@@ -259,7 +259,7 @@ class TrModel(TrBase):
         logits = self.actor(h)
         value = self.critic(h)
         value = scaled_sigmoid(value)
-        return logits, value, attn_weights
+        return logits, value, attn_weights, h
 
 
 class SeqConv2d(nn.Conv2d):
@@ -566,23 +566,36 @@ class CNNModel2(nn.Module):
         return dist, value
 
 
-class LFCNNModel2(CNNModel2):
-    def __init__(self, cfg: Config, num_outputs) -> None:
-        super().__init__(cfg, num_outputs)
-        self.up_feature = layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=64 * 7 * 7))
+class LFBaseModel(nn.Module):
+    def __init__(self, cfg: Config, c, h, w, c_out):
+        super().__init__()
+        self.up_feature = layer_init(nn.Linear(in_features=cfg.hidden_dim, out_features=c * h * w))
 
         n_up = len(lookforward_step_indices(cfg.lookforward))
         self.up_states = nn.ModuleList([
             nn.Sequential(OrderedDict([
-                ('flatten', nn.Unflatten(1, (64, 7, 7))),
+                ('unflatten', nn.Unflatten(1, (c, h, w))),
                 ('act1', nn.ReLU()),
-                ('upconv1', layer_init(nn.ConvTranspose2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0))),
+                ('upconv1', layer_init(nn.ConvTranspose2d(in_channels=c, out_channels=c, kernel_size=3, stride=1, padding=0))),
                 ('act2', nn.ReLU()),
-                ('upconv2', layer_init(nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=4, stride=2, padding=0))),
+                ('upconv2', layer_init(nn.ConvTranspose2d(in_channels=c, out_channels=c // 2, kernel_size=4, stride=2, padding=0))),
                 ('act3', nn.ReLU()),            
-                ('upconv3', layer_init(nn.ConvTranspose2d(in_channels=32, out_channels=4, kernel_size=8, stride=4, padding=0))),
+                ('upconv3', layer_init(nn.ConvTranspose2d(in_channels=c // 2, out_channels=c_out, kernel_size=8, stride=4, padding=0))),
             ])) for _ in range(n_up)
         ])
+
+    def forward(self, feature):
+        up_feature = self.up_feature(feature)
+        up_states = []
+        for up in self.up_states:
+            up_states.append(up(up_feature))
+        return up_states
+
+
+class LFCNNModel2(CNNModel2):
+    def __init__(self, cfg: Config, num_outputs) -> None:
+        super().__init__(cfg, num_outputs)
+        self.lf_model = LFBaseModel(cfg, 64, 7, 7, 4)
 
     def forward(self, x: torch.Tensor):
         feature = self.feature(x)
@@ -590,11 +603,18 @@ class LFCNNModel2(CNNModel2):
         dist = Categorical(logits=logits)
         value = self.critic(feature)
         value = scaled_sigmoid(value)
-        up_feature = self.up_feature(feature)
-        up_states = []
-        for up in self.up_states:
-            up_states.append(up(up_feature))
+        up_states = self.lf_model.forward(feature)
         return dist, value, *up_states
+
+
+class LFTrModel(TrModel):
+    def __init__(self, cfg, num_outputs):
+        super().__init__(cfg, num_outputs)
+        self.lf_model = LFBaseModel(Config(lookforward=cfg.lookforward, hidden_dim=cfg.dim_input), 32, 7, 7, 1)
+
+    def forward(self, x, query_mask=None, key_mask=None, is_train=False, lookback=0):
+        logits, value, attn_weights, h = super().forward(x, query_mask, key_mask, is_train, lookback)
+        return logits, value, attn_weights, h
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):

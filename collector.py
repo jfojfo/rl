@@ -289,6 +289,16 @@ class BaseGenerator:
             yield self.data_fn(*[d[i:i + self.batch_size] for d in self.data])
             self.inc_iter()
 
+    def extend_lf_states(self, seq_data, lookforward):
+        sq_states = seq_data[Collector.StateIndex]
+        length = len(sq_states) - lookforward
+        data = [d[:length] for d in seq_data]
+
+        indices = lookforward_step_indices(lookforward)
+        lf_states = [sq_states[i:i+length] for i in indices]
+        data.extend(lf_states)
+        return data
+
 
 class EpDataGenerator(BaseGenerator):
     def __init__(self, episodes, batch_size, data_fn, random=False):
@@ -416,13 +426,7 @@ class SqDataGenerator(EpDataGenerator):
 class LFSqDataGenerator(SqDataGenerator):
     def __init__(self, seq_data, batch_size, data_fn, random=False, lookforward=0):
         self.lookforward = lookforward
-        sq_states = seq_data[Collector.StateIndex]
-        length = len(sq_states) - lookforward
-        data = [d[:length] for d in seq_data]
-
-        indices = lookforward_step_indices(lookforward)
-        lf_states = [sq_states[i:i+length] for i in indices]
-        data.extend(lf_states)
+        data = self.extend_lf_states(seq_data, lookforward)
         super().__init__(data, batch_size, data_fn, random)
 
 
@@ -478,6 +482,13 @@ class LookBackBatchChunkDataGenerator(BaseGenerator):
             self.offset = min(i, self.lookback)
             yield self.data_fn(*[d[i - self.offset:i + self.batch_size] for d in self.data])
             self.inc_iter()            
+
+
+class LFLookBackBatchChunkDataGenerator(LookBackBatchChunkDataGenerator):
+    def __init__(self, batch_size, lookback, offset, lookforward, data_fn, *data):
+        self.lookforward = lookforward
+        data = self.extend_lf_states(data, lookforward)
+        super().__init__(batch_size, lookback, offset, data_fn, *data)
 
 
 class LookBackBatchSeqDataGenerator(LookBackBatchChunkDataGenerator):

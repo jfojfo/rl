@@ -20,8 +20,8 @@ from stable_baselines3.common.atari_wrappers import (
 
 
 config = {
-    'model_net': 'cnn_lf',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
-    'model': 'ppo.seq.cnn.lookforward',
+    'model_net': 'transformer_lf',  # mlp, cnn, cnn3d, transformer, transformercnn, dt
+    'model': 'ppo.seq.transformer.lookforward',
     'model_dir': 'models',
     'env_id_list': ['Breakout-v5'] * 8,
     'envpool': True,
@@ -30,7 +30,7 @@ config = {
     # 'env_id_list': ['PongNoFrameskip-v4', 'BreakoutNoFrameskip-v4', 'SpaceInvadersNoFrameskip-v4', 'MsPacmanNoFrameskip-v4'],
     'game_visible': False,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    # 'wandb': 'ppo.seq.cnn.lookforward',
+    # 'wandb': 'ppo.seq.transformer.lookforward',
     # 'run_in_notebook': True,
     'wandb': None,
     'run_in_notebook': False,
@@ -39,7 +39,7 @@ config = {
     'hidden_dim': 512,  # hidden size, linear units of the output layer
     'c_critic': 1.0,  # critic coefficient
     'c_entropy': 0.01,  # entropy coefficient
-    'c_pred_states': 0.05,
+    'c_pred_states': 0.1,
     'gamma': 0.99,
     'lam': 0.95,
     'surr_clip': 0.2,
@@ -52,15 +52,15 @@ config = {
     'chunk_percent': 1/8,  # split into chunks, do optimise per chunk
     'chunk_size': None,
     'seq_len': 65,
-    'lookforward': 8,
+    'lookforward': 1,
     'epoch_size': 256,
     'epoch_episodes': 8,
-    'epoch_save': 300,
+    'epoch_save': 900,
     'max_epoch': 20000,
     'max_episode_steps': 8000,
     'target_reward': 20000000,
     'diff_state': False,
-    'shuffle': True,
+    'shuffle': False,
 
     'transformer': {
         'num_blocks': 1,
@@ -79,6 +79,7 @@ config = {
 cfg = Config(**config)
 cfg.transformer.device = cfg.device
 cfg.transformer.window_size = cfg.seq_len - 1
+cfg.transformer.lookforward = cfg.lookforward
 # cfg.n_actions = cfg.transformer.action_dim = 4 # env_.action_space.n
 
 
@@ -104,7 +105,7 @@ def discount_gae(rewards, dones, values, next_value, gamma=0.99, lam=0.95):
 
 def loss_ppo(trainer, data_loader, states, actions, dones, old_log_probs, old_values, rewards, advantages, *extra):
     params = trainer.get_model_params(data_loader, states, *extra, is_train=True)
-    _, log_probs, values, entropy = trainer.predict(*params, actions, is_train=True)
+    _, log_probs, values, entropy, *pred_extra = trainer.predict(*params, actions, is_train=True)
 
     # todo: normalize?
     # advantages = rewards - values.detach()
@@ -130,7 +131,18 @@ def loss_ppo(trainer, data_loader, states, actions, dones, old_log_probs, old_va
     critic_loss = 0.5 * critic_loss.sum() / len(data_loader)
     entropy_loss = -entropy.sum() / len(data_loader)
     loss = actor_loss + critic_loss * cfg.c_critic + entropy_loss * cfg.c_entropy
-    return {'critic_loss': critic_loss, 'actor_loss': actor_loss, 'entropy_loss': entropy_loss, 'loss': loss}
+    loss_dict = {'critic_loss': critic_loss, 'actor_loss': actor_loss, 'entropy_loss': entropy_loss}
+
+    if cfg.lookforward > 0:
+        pred_states_loss = 0
+        # todo remove extra[-1] mask for transformer
+        for up_state, target_state in zip(pred_extra, extra):
+            pred_states_loss += 0.5 * (up_state - target_state).pow(2).mean(dim=(1,2,3)).sum() / len(data_loader)
+            loss += pred_states_loss * cfg.c_pred_states
+        loss_dict['pred_states_loss'] = pred_states_loss
+
+    loss_dict['loss'] = loss
+    return loss_dict
 
 
 class Train:
@@ -233,6 +245,8 @@ class Train:
             return TrModel(cfg.transformer, num_outputs)
         elif cfg.model_net == 'transformercnn':
             return TransformerCNNModel(cfg.transformer, num_outputs)
+        elif cfg.model_net == 'transformer_lf':
+            return LFTrModel(cfg.transformer, num_outputs)
         elif cfg.model_net == 'dt':
             return DTModel(cfg.transformer, num_outputs)
 
@@ -282,8 +296,9 @@ class Train:
         self.collector.clear_all()
         return envs.reset()
 
-    def get_data_collector(self):
-        return BatchEpisodeCollector(len(cfg.env_id_list))
+    def get_data_collector(self, is_train=True):
+        n = len(cfg.env_id_list) if is_train else 1
+        return BatchEpisodeCollector(n)
 
     def train_eval(self):
         return self.avg_reward
@@ -488,7 +503,7 @@ class Train:
         # state = grey_crop_resize(state, env.spec.id)
         last_state = state.copy()
 
-        collector = BatchEpisodeCollector(1)
+        collector = self.get_data_collector(is_train=False)
         done = False
         total_reward = 0
         steps = 0
@@ -544,7 +559,7 @@ class SeqTrain(Train):
             next_action, next_log_prob, next_value, *_ = self.predict(*params)
 
         self.update_1_env(seq_data)
-        del seq_data[6:]
+        del seq_data[6:]  # remove infos
 
         sq_states, sq_actions, sq_rewards, sq_dones, sq_log_probs, sq_values = seq_data
         sq_values_scaled = reverse_scaled_sigmoid(torch.as_tensor(np.array(sq_values))).numpy()
@@ -557,11 +572,12 @@ class SeqTrain(Train):
         # sq_advantages = list(normalize(np.array(sq_advantages)))
         seq_data.insert(len(seq_data), sq_advantages)
 
-        total_samples = len(sq_states) * len(sq_states[0])
+        # total_samples = len(sq_states) * len(sq_states[0])
+        total_samples = cfg.epoch_size * len(sq_states[0])
         return total_samples
 
     def update_1_env(self, seq_data):
-        offset = len(seq_data[0]) - cfg.epoch_size
+        offset = len(seq_data[0]) - cfg.epoch_size - cfg.lookforward
         seq_data = [d[offset:] for d in seq_data]
 
         if not hasattr(self, 'total_runs'):
@@ -585,8 +601,9 @@ class SeqTrain(Train):
             self.total_steps *= (1 - term)
             self.total_rewards *= (1 - term)
 
-    def get_data_collector(self):
-        return MultiStepCollector(cfg.epoch_size, len(cfg.env_id_list))
+    def get_data_collector(self, is_train=True):
+        n = len(cfg.env_id_list) if is_train else 1
+        return MultiStepCollector(cfg.epoch_size, n)
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
         return SqDataGenerator(seq_data, chunk_size, data_fn, random)
@@ -610,8 +627,9 @@ class SeqTrain(Train):
 
 # lookforward
 class LFSeqTrain(SeqTrain):
-    def get_data_collector(self):
-        return MultiStepCollector(cfg.epoch_size, len(cfg.env_id_list), lookforward=cfg.lookforward)
+    def get_data_collector(self, is_train=True):
+        n = len(cfg.env_id_list) if is_train else 1
+        return MultiStepCollector(cfg.epoch_size, n, lookforward=cfg.lookforward)
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
         return LFSqDataGenerator(seq_data, chunk_size, data_fn, random, cfg.lookforward)
@@ -631,41 +649,11 @@ class LFSeqTrain(SeqTrain):
             log_prob = dist.log_prob(action)
             return action.detach().cpu().numpy().astype(np.int32), log_prob.detach().cpu().numpy(), value.detach().cpu().numpy()
 
-    def loss(self, data_loader, states, actions, dones, old_log_probs, old_values, rewards, advantages, *extra):
-        params = self.get_model_params(data_loader, states, *extra, is_train=True)
-        _, log_probs, values, entropy, *up_states = self.predict(*params, actions, is_train=True)
-
-        # todo: normalize?
-        # advantages = rewards - values.detach()
-        # no norm for transformer, will cause NaN
-        advantages = normalize(advantages)
-        ratio = (log_probs - old_log_probs).exp()
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - cfg.surr_clip, 1.0 + cfg.surr_clip) * advantages
-        actor_loss = -torch.min(surr1, surr2).sum() / len(data_loader)
-
-        actor_clip_fracs = ((ratio - 1.0).abs() > cfg.surr_clip).float().mean()
-        self.writer.stash_summary('Monitor', {'actor_clip_fracs': actor_clip_fracs}, weight=len(data_loader))
-
-        critic_loss = (values - rewards).pow(2)
-        if cfg.value_clip is not None:
-            critic_clip_fracs = ((values - old_values).abs() > cfg.value_clip).float().mean()
-            self.writer.stash_summary('Monitor', {'critic_clip_fracs': critic_clip_fracs}, weight=len(data_loader))
-
-        critic_loss = 0.5 * critic_loss.sum() / len(data_loader)
-        entropy_loss = -entropy.sum() / len(data_loader)
-
-        pred_states_loss = 0
-        for up_state, target_state in zip(up_states, extra):
-            pred_states_loss += 0.5 * (up_state - target_state).pow(2).mean(dim=(1,2,3)).sum() / len(data_loader)
-
-        loss = actor_loss + critic_loss * cfg.c_critic + entropy_loss * cfg.c_entropy + pred_states_loss * cfg.c_pred_states
-        return {'critic_loss': critic_loss, 'actor_loss': actor_loss, 'entropy_loss': entropy_loss, 'loss': loss, 'pred_states_loss': pred_states_loss}
-
 
 class SeqTrainCNN3d(SeqTrain):
-    def get_data_collector(self):
-        return MultiStepCollector(cfg.epoch_size, len(cfg.env_id_list), lookback=cfg.seq_len - 1)
+    def get_data_collector(self, is_train=True):
+        n = len(cfg.env_id_list) if is_train else 1
+        return MultiStepCollector(cfg.epoch_size, n, lookback=cfg.seq_len - 1)
 
     def get_model_params(self, collector, state, *_, is_train=False):
         if is_train:
@@ -690,8 +678,9 @@ class SeqTrainTransformer(SeqTrain):
         seq_data[Collector.DoneIndex] = terminated
         return ret
 
-    def get_data_collector(self):
-        return TrMultiStepCollector(cfg.epoch_size, len(cfg.env_id_list), lookback=cfg.transformer.window_size)
+    def get_data_collector(self, is_train=True):
+        n = len(cfg.env_id_list) if is_train else 1
+        return TrMultiStepCollector(cfg.epoch_size, n, lookback=cfg.transformer.window_size)
 
     def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
         offset = len(seq_data[0]) - cfg.epoch_size
@@ -723,17 +712,17 @@ class SeqTrainTransformer(SeqTrain):
 
     def predict(self, state, query_mask, key_mask, lookback=0, n_iter=0, data_loader=None, action=None, is_train=False):
         if is_train:
-            logits, value, attn_weight = self.model(state, query_mask, key_mask, is_train=is_train, lookback=lookback)
+            logits, value, attn_weight, h = self.model(state, query_mask, key_mask, is_train=is_train, lookback=lookback)
             if n_iter == 0:
                 self.writer.summary_attns([attn[0].unsqueeze(0) for attn in attn_weight])
 
             state = state[:, lookback:]
-            state, value, logits = data_loader.trans_back(state, value, logits)
+            state, value, logits, h = data_loader.trans_back(state, value, logits, h)
             dist = Categorical(logits=logits)
             log_prob = dist.log_prob(action)
             entropy = dist.entropy()
         else:
-            logits, value, attn_weight = self.model(state, query_mask, key_mask, is_train=is_train, lookback=lookback)
+            logits, value, attn_weight, h = self.model(state, query_mask, key_mask, is_train=is_train, lookback=lookback)
             dist = Categorical(logits=logits)
             action = dist.sample()
             log_prob = dist.log_prob(action)
@@ -741,7 +730,7 @@ class SeqTrainTransformer(SeqTrain):
 
         value = value.squeeze(-1)
         if is_train:
-            return action, log_prob, value, entropy
+            return action, log_prob, value, entropy, h
         else:
             return action.detach().cpu().numpy().astype(np.int32), log_prob.detach().cpu().numpy(), value.detach().cpu().numpy()
 
@@ -755,6 +744,39 @@ class SeqTrainTransformer(SeqTrain):
         return ret
 
 
+class LFSeqTrainTransformer(SeqTrainTransformer):
+    def get_data_collector(self, is_train=True):
+        n = len(cfg.env_id_list) if is_train else 1
+        return TrMultiStepCollector(cfg.epoch_size, n, lookback=cfg.transformer.window_size, lookforward=cfg.lookforward)
+
+    def data_fn(self, *data):
+        n_lf_states = len(lookforward_step_indices(cfg.lookforward))
+        data = list(data)
+        data = data[:-n_lf_states-1] + [np.array(d) for d in data[-n_lf_states-1:-1]] + data[-1:]
+        return super().data_fn(*data)
+
+    def get_chunk_loader(self, seq_data, chunk_size, data_fn, random=False):
+        offset = len(seq_data[0]) - cfg.epoch_size - cfg.lookforward
+        return LFLookBackBatchChunkDataGenerator(chunk_size, cfg.transformer.window_size, offset, cfg.lookforward, data_fn, *seq_data)
+
+    def get_model_params(self, collector, state, *extra, is_train=False):
+        if is_train:
+            mask = extra[-1]
+            return super().get_model_params(collector, state, mask, is_train)
+        else:
+            return super().get_model_params(collector, state, None, is_train)
+
+    def predict(self, state, query_mask, key_mask, lookback=0, n_iter=0, data_loader=None, action=None, is_train=False):
+        if is_train:
+            action, log_prob, value, entropy, h = super().predict(state, query_mask, key_mask, lookback, n_iter, data_loader, action, is_train)
+            b, l, d = h.shape
+            up_states = self.model.lf_model(h.view(-1, d))
+            up_states = [s.view(b, l, *s.shape[1:]) for s in up_states]
+            return action, log_prob, value, entropy, *up_states
+        else:
+            return super().predict(state, query_mask, key_mask, lookback, n_iter, data_loader, action, is_train)
+
+
 def get_trainer():
     if cfg.model_net in ('cnn3d', 'cnn3d2d'):
         return SeqTrainCNN3d()
@@ -762,6 +784,8 @@ def get_trainer():
         return LFSeqTrain()
     elif cfg.model_net in ('transformer', 'transformercnn'):
         return SeqTrainTransformer()
+    elif cfg.model_net in ('transformer_lf',):
+        return LFSeqTrainTransformer()
     # elif cfg.model_net == 'dt':
     #     return TrainDT()
     else:
